@@ -1,18 +1,37 @@
 //! Navigator backend for web
 use js_sys::{Array, ArrayBuffer, Uint8Array};
 use ruffle_core::backend::navigator::{
-    url_from_relative_url, NavigationMethod, NavigatorBackend, OwnedFuture, RequestOptions,
+    url_from_relative_url, ConnectOptions, ConnectionEvent, NavigationMethod, NavigatorBackend,
+    OwnedFuture, RequestOptions,
 };
 use ruffle_core::indexmap::IndexMap;
 use ruffle_core::loader::Error;
 use std::borrow::Cow;
+use std::io;
+use std::io::{Read, Write};
+use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
+use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
 use web_sys::{
-    window, Blob, BlobPropertyBag, Document, Performance, Request, RequestInit, Response,
+    window, BinaryType, Blob, BlobPropertyBag, Document, Performance, Request, RequestInit,
+    Response, WebSocket,
 };
+
+// start xml
+use std::collections::{HashMap, VecDeque};
+
+enum SocketState {
+    TryConnect(ConnectOptions),
+    Connected {
+        stream: Arc<WebSocket>,
+        outgoing: VecDeque<Vec<u8>>,
+        queue: VecDeque<u8>,
+    },
+}
+// end xml
 
 pub struct WebNavigatorBackend {
     performance: Performance,
@@ -20,6 +39,7 @@ pub struct WebNavigatorBackend {
     allow_script_access: bool,
     upgrade_to_https: bool,
     base_url: Option<String>,
+    sockets: HashMap<u64, SocketState>,
 }
 
 impl WebNavigatorBackend {
@@ -66,6 +86,7 @@ impl WebNavigatorBackend {
             allow_script_access,
             upgrade_to_https,
             base_url,
+            sockets: HashMap::new(),
         }
     }
 
@@ -271,5 +292,122 @@ impl NavigatorBackend for WebNavigatorBackend {
             log::error!("Url::set_scheme failed on: {}", url);
         }
         url
+    }
+
+    fn xmlsocket_connect(&mut self, socket_id: u64, c: ConnectOptions) {
+        log::error!(
+            "Schedule connect to socket {} host {} port {}",
+            socket_id,
+            c.host,
+            c.port
+        );
+        self.sockets.insert(socket_id, SocketState::TryConnect(c));
+    }
+
+    fn xmlsocket_send(&mut self, socket_id: &u64, data: Vec<u8>) {
+        log::error!("Schedule send to socket {}", socket_id);
+        if let Some(SocketState::Connected { outgoing, .. }) = self.sockets.get_mut(socket_id) {
+            log::error!("Connected and schedule sent");
+            outgoing.push_back(data);
+        }
+    }
+
+    fn xmlsocket_update(
+        &mut self,
+        socket_id: &u64,
+        buffer: &mut [u8; 1024],
+    ) -> Vec<ConnectionEvent> {
+        let mut events = Vec::<ConnectionEvent>::new();
+        if let Some(st) = self.sockets.get_mut(socket_id) {
+            match st {
+                SocketState::TryConnect(c) => {
+                    log::error!("Try connect update, connecting...");
+                    let ws = WebSocket::new(format!("ws://127.0.0.1:{}", c.port).as_str()); //*c.host, c.port)); */
+                    match ws {
+                        Ok(ws) => {
+                            ws.set_binary_type(BinaryType::Arraybuffer);
+                            let onopen_callback = Closure::wrap(Box::new(|_| {
+                                log::error!("socket opened");
+                                *st = SocketState::Connected {
+                                    stream: Arc::new(ws),
+                                    queue: VecDeque::new(),
+                                    outgoing: VecDeque::new(),
+                                };
+                                events.push(ConnectionEvent::ConnectionResult(true));
+                            })
+                                as Box<dyn FnMut(JsValue)>);
+                            ws.set_onopen(Some(onopen_callback.as_ref().unchecked_ref()));
+                            onopen_callback.forget();
+                        }
+                        Err(err) => {
+                            log::error!("Connection failed!");
+                            events.push(ConnectionEvent::ConnectionResult(false));
+                            self.sockets.remove(socket_id);
+                        }
+                    }
+
+                    /*
+                        match r {
+                            Ok(stream) => {
+                                log::error!("Connected, pushing to event!");
+                                *st = SocketState::Connected {
+                                    stream,
+                                    queue: VecDeque::new(),
+                                    outgoing: VecDeque::new(),
+                                };
+                                events.push(ConnectionEvent::ConnectionResult(true));
+                            }
+                            Err(err) => {
+                                log::error!("Connection failed! {}", err);
+                                events.push(ConnectionEvent::ConnectionResult(false));
+                                self.sockets.remove(socket_id);
+                            }
+                        }
+                    } */ /*
+                         SocketState::Connected {
+                             stream,
+                             queue,
+                             outgoing,
+                         } => {
+                             log::error!("Connected, updating...");
+                             let _ = stream.write_all(
+                                 &outgoing.iter().fold(Vec::<u8>::new(), |mut s, o| {
+                                     s.extend(o);
+                                     // every message sent to the server is terminated by a null byte
+                                     s.push(0);
+                                     s
+                                 })[..],
+                             );
+                             outgoing.clear();
+                             match stream.read(buffer) {
+                                 Ok(l) if l > 0 => {
+                                     queue.extend(&buffer[0..l]);
+                                     let mut i = 0;
+                                     while i < queue.len() {
+                                         if i > 0 && queue[i] == 0x00 {
+                                             log::error!("Message received");
+                                             let message = queue.drain(0..i).collect();
+                                             // remove the null byte
+                                             queue.pop_front();
+                                             events.push(ConnectionEvent::Data(message));
+                                             // restart to the start
+                                             i = 0;
+                                         }
+                                         i += 1;
+                                     }
+                                 }
+                                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                                 Err(_) | Ok(_) => {
+                                     log::error!("Connection closed");
+                                     self.sockets.remove(socket_id);
+                                     events.push(ConnectionEvent::Closed);
+                                 }
+                             }
+                         }
+                         */
+                }
+            }
+        }
+        events
     }
 }

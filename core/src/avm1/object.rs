@@ -26,12 +26,15 @@ use crate::avm1::object::transform_object::TransformObject;
 use crate::avm1::object::xml_attributes_object::XmlAttributesObject;
 use crate::avm1::object::xml_node_object::XmlNodeObject;
 use crate::avm1::object::xml_object::XmlObject;
+use crate::avm1::object::xml_socket::XmlSocket;
 use crate::avm1::{AvmString, ScriptObject, SoundObject, StageObject, Value};
 use crate::display_object::DisplayObject;
 use crate::xml::XmlNode;
 use gc_arena::{Collect, MutationContext};
 use ruffle_macros::enum_trait_object;
 use std::fmt::Debug;
+
+use self::xml_socket::XmlSocketData;
 
 pub mod array_object;
 pub mod bevel_filter;
@@ -58,6 +61,7 @@ pub mod value_object;
 pub mod xml_attributes_object;
 pub mod xml_node_object;
 pub mod xml_object;
+pub mod xml_socket;
 
 /// Represents an object that can be directly interacted with by the AVM
 /// runtime.
@@ -91,6 +95,7 @@ pub mod xml_object;
         DateObject(DateObject<'gc>),
         BitmapData(BitmapDataObject<'gc>),
         TextFormatObject(TextFormatObject<'gc>),
+        XmlSocket(XmlSocket<'gc>)
     }
 )]
 pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy {
@@ -548,6 +553,10 @@ pub trait TObject<'gc>: 'gc + Collect + Debug + Into<Object<'gc>> + Clone + Copy
 
     /// Get the underlying `SharedObject`, if it exists
     fn as_shared_object(&self) -> Option<SharedObject<'gc>> {
+        None
+    }
+
+    fn as_xml_socket(&self) -> Option<XmlSocketData<'gc>> {
         None
     }
 

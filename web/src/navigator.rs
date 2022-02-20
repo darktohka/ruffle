@@ -7,17 +7,15 @@ use ruffle_core::backend::navigator::{
 use ruffle_core::indexmap::IndexMap;
 use ruffle_core::loader::Error;
 use std::borrow::Cow;
-use std::io;
-use std::io::{Read, Write};
-use std::sync::Arc;
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 use url::Url;
-use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{spawn_local, JsFuture};
+use wasm_sockets::{self, ConnectionStatus, Message};
 use web_sys::{
-    window, BinaryType, Blob, BlobPropertyBag, Document, Performance, Request, RequestInit,
-    Response, WebSocket,
+    window, Blob, BlobPropertyBag, Document, Performance, Request, RequestInit, Response,
 };
 
 // start xml
@@ -25,10 +23,12 @@ use std::collections::{HashMap, VecDeque};
 
 enum SocketState {
     TryConnect(ConnectOptions),
+    Connecting {
+        stream: Rc<RefCell<wasm_sockets::PollingClient>>,
+    },
     Connected {
-        stream: Arc<WebSocket>,
+        stream: Rc<RefCell<wasm_sockets::PollingClient>>,
         outgoing: VecDeque<Vec<u8>>,
-        queue: VecDeque<u8>,
     },
 }
 // end xml
@@ -312,99 +312,91 @@ impl NavigatorBackend for WebNavigatorBackend {
         }
     }
 
-    fn xmlsocket_update(
-        &mut self,
-        socket_id: &u64,
-        buffer: &mut [u8; 1024],
-    ) -> Vec<ConnectionEvent> {
+    fn xmlsocket_update(&mut self, socket_id: &u64) -> Vec<ConnectionEvent> {
         let mut events = Vec::<ConnectionEvent>::new();
+
         if let Some(st) = self.sockets.get_mut(socket_id) {
             match st {
                 SocketState::TryConnect(c) => {
-                    log::error!("Try connect update, connecting...");
-                    let ws = WebSocket::new(format!("ws://127.0.0.1:{}", c.port).as_str()); //*c.host, c.port)); */
+                    // Eventually, change this to wss://{}:{}
+                    let ws = wasm_sockets::PollingClient::new(
+                        format!("ws://127.0.0.1:{}", c.port).as_str(),
+                    ); //*c.host, c.port)); */
                     match ws {
                         Ok(ws) => {
-                            ws.set_binary_type(BinaryType::Arraybuffer);
-                            let onopen_callback = Closure::wrap(Box::new(|_| {
-                                log::error!("socket opened");
-                                *st = SocketState::Connected {
-                                    stream: Arc::new(ws),
-                                    queue: VecDeque::new(),
-                                    outgoing: VecDeque::new(),
-                                };
-                                events.push(ConnectionEvent::ConnectionResult(true));
-                            })
-                                as Box<dyn FnMut(JsValue)>);
-                            ws.set_onopen(Some(onopen_callback.as_ref().unchecked_ref()));
-                            onopen_callback.forget();
+                            *st = SocketState::Connecting {
+                                stream: Rc::new(RefCell::new(ws)),
+                            };
                         }
-                        Err(err) => {
-                            log::error!("Connection failed!");
+                        Err(_) => {
                             events.push(ConnectionEvent::ConnectionResult(false));
                             self.sockets.remove(socket_id);
                         }
                     }
+                }
+                SocketState::Connecting { stream } => {
+                    let status = stream.borrow().status();
 
-                    /*
-                        match r {
-                            Ok(stream) => {
-                                log::error!("Connected, pushing to event!");
-                                *st = SocketState::Connected {
-                                    stream,
-                                    queue: VecDeque::new(),
-                                    outgoing: VecDeque::new(),
-                                };
-                                events.push(ConnectionEvent::ConnectionResult(true));
+                    match status {
+                        ConnectionStatus::Disconnected => {
+                            events.push(ConnectionEvent::ConnectionResult(false));
+                            self.sockets.remove(socket_id);
+                        }
+                        ConnectionStatus::Error => {
+                            events.push(ConnectionEvent::ConnectionResult(false));
+                            self.sockets.remove(socket_id);
+                        }
+                        ConnectionStatus::Connected => {
+                            *st = SocketState::Connected {
+                                stream: stream.clone(),
+                                outgoing: VecDeque::new(),
+                            };
+                            events.push(ConnectionEvent::ConnectionResult(true));
+                        }
+                        ConnectionStatus::Connecting => {}
+                    }
+                }
+                SocketState::Connected { stream, outgoing } => {
+                    let status = stream.borrow().status();
+
+                    match status {
+                        ConnectionStatus::Disconnected => {
+                            events.push(ConnectionEvent::Closed);
+                            self.sockets.remove(socket_id);
+                        }
+                        ConnectionStatus::Error => {
+                            events.push(ConnectionEvent::Closed);
+                            self.sockets.remove(socket_id);
+                        }
+                        ConnectionStatus::Connected => {
+                            let mut curr_stream = stream.borrow_mut();
+
+                            for message in outgoing.iter() {
+                                match std::str::from_utf8(message) {
+                                    Ok(v) => {
+                                        curr_stream.send_string(v).ok();
+                                    }
+                                    Err(_) => {
+                                        curr_stream.send_binary(message.to_vec()).ok();
+                                    }
+                                }
                             }
-                            Err(err) => {
-                                log::error!("Connection failed! {}", err);
-                                events.push(ConnectionEvent::ConnectionResult(false));
-                                self.sockets.remove(socket_id);
+
+                            outgoing.clear();
+
+                            for message in curr_stream.receive().iter() {
+                                match message {
+                                    Message::Text(c) => {
+                                        events.push(ConnectionEvent::Data(c.as_bytes().to_vec()));
+                                    }
+                                    Message::Binary(c) => {
+                                        events.push(ConnectionEvent::Data(c.to_vec()));
+                                    }
+                                }
                             }
                         }
-                    } */ /*
-                         SocketState::Connected {
-                             stream,
-                             queue,
-                             outgoing,
-                         } => {
-                             log::error!("Connected, updating...");
-                             let _ = stream.write_all(
-                                 &outgoing.iter().fold(Vec::<u8>::new(), |mut s, o| {
-                                     s.extend(o);
-                                     // every message sent to the server is terminated by a null byte
-                                     s.push(0);
-                                     s
-                                 })[..],
-                             );
-                             outgoing.clear();
-                             match stream.read(buffer) {
-                                 Ok(l) if l > 0 => {
-                                     queue.extend(&buffer[0..l]);
-                                     let mut i = 0;
-                                     while i < queue.len() {
-                                         if i > 0 && queue[i] == 0x00 {
-                                             log::error!("Message received");
-                                             let message = queue.drain(0..i).collect();
-                                             // remove the null byte
-                                             queue.pop_front();
-                                             events.push(ConnectionEvent::Data(message));
-                                             // restart to the start
-                                             i = 0;
-                                         }
-                                         i += 1;
-                                     }
-                                 }
-                                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                                 Err(_) | Ok(_) => {
-                                     log::error!("Connection closed");
-                                     self.sockets.remove(socket_id);
-                                     events.push(ConnectionEvent::Closed);
-                                 }
-                             }
-                         }
-                         */
+                        ConnectionStatus::Connecting => {}
+                    }
                 }
             }
         }

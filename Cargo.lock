@@ -3068,6 +3068,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-sockets",
  "web-sys",
 ]
 
@@ -3771,6 +3772,19 @@ name = "wasm-bindgen-shared"
 version = "0.2.78"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0237232789cf037d5480773fe568aac745bfe2afbc11a863e97901780a6b47cc"
+
+[[package]]
+name = "wasm-sockets"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8f79197ff5b54945ab40e5fc6337dc8be541e113ff7e13884aa9ffe52c90860"
+dependencies = [
+ "js-sys",
+ "log",
+ "thiserror",
+ "wasm-bindgen",
+ "web-sys",
+]
 
 [[package]]
 name = "wayland-client"

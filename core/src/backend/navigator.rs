@@ -201,12 +201,7 @@ pub trait NavigatorBackend {
 
     /// Update the list of sockets, prossibly generating new socket events.
     /// Note: this function MUST not be blocking.
-    /// Note: the buffer is not guaranteed to be zero filled.
-    fn xmlsocket_update(
-        &mut self,
-        socket_id: &u64,
-        buffer: &mut [u8; 1024],
-    ) -> Vec<ConnectionEvent>;
+    fn xmlsocket_update(&mut self, socket_id: &u64) -> Vec<ConnectionEvent>;
 
     /// Get the amount of time since the SWF was launched.
     /// Used by the `getTimer` ActionScript call.
@@ -430,7 +425,7 @@ impl NavigatorBackend for NullNavigatorBackend {
         unimplemented!()
     }
 
-    fn xmlsocket_update(&mut self, _: &u64, _: &mut [u8; 1024]) -> Vec<ConnectionEvent> {
+    fn xmlsocket_update(&mut self, _: &u64) -> Vec<ConnectionEvent> {
         unimplemented!()
     }
 }

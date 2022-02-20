@@ -204,11 +204,7 @@ impl NavigatorBackend for ExternalNavigatorBackend {
         }
     }
 
-    fn xmlsocket_update(
-        &mut self,
-        socket_id: &u64,
-        buffer: &mut [u8; 1024],
-    ) -> Vec<ConnectionEvent> {
+    fn xmlsocket_update(&mut self, socket_id: &u64) -> Vec<ConnectionEvent> {
         let mut events = Vec::<ConnectionEvent>::new();
         if let Some(st) = self.sockets.get_mut(socket_id) {
             match st {
@@ -250,6 +246,7 @@ impl NavigatorBackend for ExternalNavigatorBackend {
                             s
                         })[..],
                     );
+                    let mut buffer = [0u8; 1024];
                     outgoing.clear();
                     match stream.read(buffer) {
                         Ok(l) if l > 0 => {

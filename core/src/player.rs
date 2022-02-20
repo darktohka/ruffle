@@ -1722,14 +1722,13 @@ impl Player {
     /// Poll alive XMLSockets and run the according callbacks.
     pub fn xmlsocket_update(&mut self) {
         self.mutate_with_update_context(|uc| {
-            let mut buffer = [0u8; 1024];
             uc.xml_socket
                 .sockets
                 .clone()
                 .iter()
                 .for_each(|(socket_id, object)| {
                     uc.navigator
-                        .xmlsocket_update(socket_id, &mut buffer)
+                        .xmlsocket_update(socket_id)
                         .into_iter()
                         .for_each(|event| {
                             match event {

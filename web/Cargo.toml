@@ -61,3 +61,6 @@ features = [
     "Navigator", "Node", "Performance", "PointerEvent", "ScriptProcessorNode", "UiEvent", "Window", "Location", "HtmlFormElement",
     "KeyboardEvent", "Path2d", "CanvasGradient", "CanvasPattern", "SvgMatrix", "SvgsvgElement", "Response", "Request", "RequestInit",
     "Blob", "BlobPropertyBag", "Storage", "WheelEvent", "ImageData", "WebSocket", "BinaryType"]
+
+[dependencies.wasm-sockets]
+version = "0.2.2"

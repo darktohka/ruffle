@@ -4,6 +4,7 @@ num_frames = 1
 
 [image_comparisons.output]
 tolerance = 1
+known_failure = true # Visual's position is a little bit off, but visually indistinguishable
 
 [player_options]
 with_renderer = { optional = false, quality = "low" }

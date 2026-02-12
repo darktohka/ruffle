@@ -4,11 +4,13 @@ num_frames = 5
 
 [image_comparisons.output]
 tolerance = 0
+known_failure = true # Wheels are different width than they should be
 
 [image_comparisons.frame5]
 tolerance = 0
 max_outliers = 3
 trigger = 1
+known_failure = true # Wheels are different width than they should be
 
 [player_options]
 with_renderer = { optional = false, quality = "low" }

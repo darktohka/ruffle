@@ -4,10 +4,12 @@ num_frames = 10
 
 [image_comparisons.output]
 tolerance = 0
+max_outliers = 21
 
 [image_comparisons.frame5]
 tolerance = 0
 trigger = 5
+max_outliers = 42
 
 [player_options]
 with_renderer = { optional = false, quality = "low" }

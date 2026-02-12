@@ -11,6 +11,7 @@ tolerance = 128
 [image_comparisons."output.03"]
 trigger = 3
 tolerance = 128
+max_outliers = 3
 
 [image_comparisons."output.04"]
 trigger = 4

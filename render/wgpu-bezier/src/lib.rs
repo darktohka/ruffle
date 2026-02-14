@@ -172,6 +172,28 @@ pub struct GlobalsUniform {
     pub view_matrix: [[f32; 4]; 4],
 }
 
+/// Per-draw analytic path parameters for winding-correct fills and direct
+/// quadratic stroke rasterization.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Pod, Zeroable)]
+pub struct AnalyticParams {
+    /// [min_x, min_y, max_x, max_y] in object-space pixels.
+    pub bounds: [f32; 4],
+    /// Segment count in the storage buffer.
+    pub num_segments: u32,
+    /// 0 = fill, 1 = stroke.
+    pub mode: u32,
+    /// 0 = even-odd, 1 = non-zero.
+    pub fill_rule: u32,
+    /// Stroke half-width in object-space pixels.
+    pub half_width: f32,
+    /// Packed cap/join flags for future expansion.
+    pub cap_join_flags: u32,
+    /// Reserved. Kept at 3 words so the struct size is 48 bytes, matching WGSL
+    /// uniform layout rounding to 16-byte alignment.
+    pub _pad0: [u32; 3],
+}
+
 /// A GPU texture owned by this backend.
 #[derive(Debug)]
 pub struct Texture {

@@ -1158,6 +1158,13 @@ async fn request_device(
     limits = limits.using_alignment(adapter.limits());
     limits.max_uniform_buffer_binding_size = adapter.limits().max_uniform_buffer_binding_size;
     limits.max_inter_stage_shader_components = adapter.limits().max_inter_stage_shader_components;
+    // Needed by the wgpu-bezier analytic path (fragment-read storage buffers).
+    // `downlevel_webgl2_defaults` can keep this at 0 unless we explicitly
+    // propagate adapter support here.
+    limits.max_storage_buffers_per_shader_stage =
+        adapter.limits().max_storage_buffers_per_shader_stage;
+    limits.max_storage_buffer_binding_size =
+        adapter.limits().max_storage_buffer_binding_size;
     // This will be a default limit in a future wgpu version (down from 8).
     // It's required for some WebGL devices to be supported.
     limits.max_color_attachments = 4;

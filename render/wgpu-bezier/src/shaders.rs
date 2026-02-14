@@ -16,6 +16,12 @@ pub struct Shaders {
     pub bezier_bitmap: wgpu::ShaderModule,
     /// Bitmap rendering for Command::RenderBitmap (simpler bind group).
     pub render_bitmap: wgpu::ShaderModule,
+    /// Analytic color path shader (fills + strokes).
+    pub analytic_color: wgpu::ShaderModule,
+    /// Analytic gradient path shader.
+    pub analytic_gradient: wgpu::ShaderModule,
+    /// Analytic bitmap path shader.
+    pub analytic_bitmap: wgpu::ShaderModule,
     /// Simple copy/blit shader for final presentation.
     pub copy: wgpu::ShaderModule,
     /// Complex blend mode shaders (one per ComplexBlend variant).
@@ -43,6 +49,9 @@ impl Shaders {
             bezier_gradient: make_shader(device, "bezier_gradient.wgsl", common, include_str!("../shaders/bezier_gradient.wgsl")),
             bezier_bitmap: make_shader(device, "bezier_bitmap.wgsl", common, include_str!("../shaders/bezier_bitmap.wgsl")),
             render_bitmap: make_shader(device, "render_bitmap.wgsl", common, include_str!("../shaders/render_bitmap.wgsl")),
+            analytic_color: make_shader(device, "analytic_color.wgsl", common, include_str!("../shaders/analytic_color.wgsl")),
+            analytic_gradient: make_shader(device, "analytic_gradient.wgsl", common, include_str!("../shaders/analytic_gradient.wgsl")),
+            analytic_bitmap: make_shader(device, "analytic_bitmap.wgsl", common, include_str!("../shaders/analytic_bitmap.wgsl")),
             copy: device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("copy.wgsl"),
                 source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/copy.wgsl").into()),

@@ -28,6 +28,8 @@ pub struct BindLayouts {
     pub bitmap: wgpu::BindGroupLayout,
     /// Layout for RenderBitmap (texture + sampler only).
     pub render_bitmap: wgpu::BindGroupLayout,
+    /// Layout for analytic fill/stroke path data (segment storage + params uniform).
+    pub analytic: Option<wgpu::BindGroupLayout>,
     /// Layout for complex blend compositing (parent_texture + current_texture + sampler).
     pub blend: wgpu::BindGroupLayout,
 }
@@ -168,6 +170,38 @@ impl BindLayouts {
             ],
         });
 
+        let analytic = if device.limits().max_storage_buffers_per_shader_stage > 0 {
+            Some(device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Bezier analytic layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: wgpu::BufferSize::new(
+                                std::mem::size_of::<crate::AnalyticParams>() as u64,
+                            ),
+                        },
+                        count: None,
+                    },
+                ],
+            }))
+        } else {
+            None
+        };
+
         let blend = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Bezier blend layout"),
             entries: &[
@@ -209,6 +243,7 @@ impl BindLayouts {
             gradient,
             bitmap,
             render_bitmap,
+            analytic,
             blend,
         }
     }
@@ -223,6 +258,12 @@ pub struct PipelineSet {
     pub gradient_fill: wgpu::RenderPipeline,
     /// Bitmap fill pipeline (bitmap texture + Loop-Blinn).
     pub bitmap_fill: wgpu::RenderPipeline,
+    /// Analytic color path pipeline (winding-correct fills + direct strokes).
+    pub analytic_color: Option<wgpu::RenderPipeline>,
+    /// Analytic gradient path pipeline.
+    pub analytic_gradient: Option<wgpu::RenderPipeline>,
+    /// Analytic bitmap path pipeline.
+    pub analytic_bitmap: Option<wgpu::RenderPipeline>,
     /// Direct bitmap render pipeline (for Command::RenderBitmap).
     pub render_bitmap: wgpu::RenderPipeline,
 }
@@ -461,7 +502,7 @@ fn create_pipeline_set(
         vertex: wgpu::VertexState {
             module: &shaders.bezier_fill,
             entry_point: Some("main_vertex"),
-            buffers: &[color_vertex_layout],
+            buffers: &[color_vertex_layout.clone()],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -551,26 +592,119 @@ fn create_pipeline_set(
         vertex: wgpu::VertexState {
             module: &shaders.render_bitmap,
             entry_point: Some("main_vertex"),
-            buffers: &[tex_vertex_layout],
+            buffers: &[tex_vertex_layout.clone()],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
             module: &shaders.render_bitmap,
             entry_point: Some("main_fragment"),
-            targets: &[color_target],
+            targets: &[color_target.clone()],
             compilation_options: Default::default(),
         }),
         primitive,
-        depth_stencil: Some(depth_stencil),
+        depth_stencil: Some(depth_stencil.clone()),
         multisample,
         multiview: None,
         cache: None,
     });
 
+    let (analytic_color, analytic_gradient, analytic_bitmap) = if let Some(analytic_layout) = &layouts.analytic {
+        let analytic_color_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("Bezier analytic color layout{suffix}")),
+            bind_group_layouts: &[&layouts.globals, &layouts.transforms, analytic_layout],
+            push_constant_ranges: &[],
+        });
+
+        let analytic_color = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&format!("Bezier analytic color pipeline{suffix}")),
+            layout: Some(&analytic_color_layout),
+            vertex: wgpu::VertexState {
+                module: &shaders.analytic_color,
+                entry_point: Some("main_vertex"),
+                buffers: &[color_vertex_layout.clone()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shaders.analytic_color,
+                entry_point: Some("main_fragment"),
+                targets: &[color_target.clone()],
+                compilation_options: Default::default(),
+            }),
+            primitive,
+            depth_stencil: Some(depth_stencil.clone()),
+            multisample,
+            multiview: None,
+            cache: None,
+        });
+
+        let analytic_gradient_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("Bezier analytic gradient layout{suffix}")),
+            bind_group_layouts: &[&layouts.globals, &layouts.transforms, &layouts.gradient, analytic_layout],
+            push_constant_ranges: &[],
+        });
+
+        let analytic_gradient = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&format!("Bezier analytic gradient pipeline{suffix}")),
+            layout: Some(&analytic_gradient_layout),
+            vertex: wgpu::VertexState {
+                module: &shaders.analytic_gradient,
+                entry_point: Some("main_vertex"),
+                buffers: &[tex_vertex_layout.clone()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shaders.analytic_gradient,
+                entry_point: Some("main_fragment"),
+                targets: &[color_target.clone()],
+                compilation_options: Default::default(),
+            }),
+            primitive,
+            depth_stencil: Some(depth_stencil.clone()),
+            multisample,
+            multiview: None,
+            cache: None,
+        });
+
+        let analytic_bitmap_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("Bezier analytic bitmap layout{suffix}")),
+            bind_group_layouts: &[&layouts.globals, &layouts.transforms, &layouts.bitmap, analytic_layout],
+            push_constant_ranges: &[],
+        });
+
+        let analytic_bitmap = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&format!("Bezier analytic bitmap pipeline{suffix}")),
+            layout: Some(&analytic_bitmap_layout),
+            vertex: wgpu::VertexState {
+                module: &shaders.analytic_bitmap,
+                entry_point: Some("main_vertex"),
+                buffers: &[tex_vertex_layout.clone()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shaders.analytic_bitmap,
+                entry_point: Some("main_fragment"),
+                targets: &[color_target.clone()],
+                compilation_options: Default::default(),
+            }),
+            primitive,
+            depth_stencil: Some(depth_stencil.clone()),
+            multisample,
+            multiview: None,
+            cache: None,
+        });
+
+        (Some(analytic_color), Some(analytic_gradient), Some(analytic_bitmap))
+    } else {
+        (None, None, None)
+    };
+
     PipelineSet {
         color_fill,
         gradient_fill,
         bitmap_fill,
+        analytic_color,
+        analytic_gradient,
+        analytic_bitmap,
         render_bitmap,
     }
 }
@@ -692,7 +826,7 @@ fn create_trivial_blend_pipeline_set(
         vertex: wgpu::VertexState {
             module: &shaders.bezier_fill,
             entry_point: Some("main_vertex"),
-            buffers: &[color_vertex_layout],
+            buffers: &[color_vertex_layout.clone()],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
@@ -776,26 +910,119 @@ fn create_trivial_blend_pipeline_set(
         vertex: wgpu::VertexState {
             module: &shaders.render_bitmap,
             entry_point: Some("main_vertex"),
-            buffers: &[tex_vertex_layout],
+            buffers: &[tex_vertex_layout.clone()],
             compilation_options: Default::default(),
         },
         fragment: Some(wgpu::FragmentState {
             module: &shaders.render_bitmap,
             entry_point: Some("main_fragment"),
-            targets: &[color_target],
+            targets: &[color_target.clone()],
             compilation_options: Default::default(),
         }),
         primitive,
-        depth_stencil: Some(depth_stencil),
+        depth_stencil: Some(depth_stencil.clone()),
         multisample,
         multiview: None,
         cache: None,
     });
 
+    let (analytic_color, analytic_gradient, analytic_bitmap) = if let Some(analytic_layout) = &layouts.analytic {
+        let analytic_color_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("Bezier analytic color layout{suffix}")),
+            bind_group_layouts: &[&layouts.globals, &layouts.transforms, analytic_layout],
+            push_constant_ranges: &[],
+        });
+
+        let analytic_color = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&format!("Bezier analytic color pipeline{suffix}")),
+            layout: Some(&analytic_color_layout),
+            vertex: wgpu::VertexState {
+                module: &shaders.analytic_color,
+                entry_point: Some("main_vertex"),
+                buffers: &[color_vertex_layout.clone()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shaders.analytic_color,
+                entry_point: Some("main_fragment"),
+                targets: &[color_target.clone()],
+                compilation_options: Default::default(),
+            }),
+            primitive,
+            depth_stencil: Some(depth_stencil.clone()),
+            multisample,
+            multiview: None,
+            cache: None,
+        });
+
+        let analytic_gradient_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("Bezier analytic gradient layout{suffix}")),
+            bind_group_layouts: &[&layouts.globals, &layouts.transforms, &layouts.gradient, analytic_layout],
+            push_constant_ranges: &[],
+        });
+
+        let analytic_gradient = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&format!("Bezier analytic gradient pipeline{suffix}")),
+            layout: Some(&analytic_gradient_layout),
+            vertex: wgpu::VertexState {
+                module: &shaders.analytic_gradient,
+                entry_point: Some("main_vertex"),
+                buffers: &[tex_vertex_layout.clone()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shaders.analytic_gradient,
+                entry_point: Some("main_fragment"),
+                targets: &[color_target.clone()],
+                compilation_options: Default::default(),
+            }),
+            primitive,
+            depth_stencil: Some(depth_stencil.clone()),
+            multisample,
+            multiview: None,
+            cache: None,
+        });
+
+        let analytic_bitmap_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("Bezier analytic bitmap layout{suffix}")),
+            bind_group_layouts: &[&layouts.globals, &layouts.transforms, &layouts.bitmap, analytic_layout],
+            push_constant_ranges: &[],
+        });
+
+        let analytic_bitmap = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&format!("Bezier analytic bitmap pipeline{suffix}")),
+            layout: Some(&analytic_bitmap_layout),
+            vertex: wgpu::VertexState {
+                module: &shaders.analytic_bitmap,
+                entry_point: Some("main_vertex"),
+                buffers: &[tex_vertex_layout.clone()],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shaders.analytic_bitmap,
+                entry_point: Some("main_fragment"),
+                targets: &[color_target.clone()],
+                compilation_options: Default::default(),
+            }),
+            primitive,
+            depth_stencil: Some(depth_stencil.clone()),
+            multisample,
+            multiview: None,
+            cache: None,
+        });
+
+        (Some(analytic_color), Some(analytic_gradient), Some(analytic_bitmap))
+    } else {
+        (None, None, None)
+    };
+
     PipelineSet {
         color_fill,
         gradient_fill,
         bitmap_fill,
+        analytic_color,
+        analytic_gradient,
+        analytic_bitmap,
         render_bitmap,
     }
 }

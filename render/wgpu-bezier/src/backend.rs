@@ -602,6 +602,7 @@ impl<T: RenderTarget> RenderBackend for BezierRenderBackend<T> {
             &bitmap_handles,
             &self.bind_layouts.gradient,
             &self.bind_layouts.bitmap,
+            self.bind_layouts.analytic.as_ref(),
             &self.default_sampler,
         );
         let arc = Arc::new(mesh);
@@ -1166,15 +1167,63 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
 
                         match &draw.draw_type {
                             DrawType::Color => {
-                                render_pass.set_pipeline(&pipelines.color_fill);
+                                if draw.analytic_bind_group.is_some()
+                                    && pipelines.analytic_color.is_some()
+                                {
+                                    render_pass.set_pipeline(
+                                        pipelines
+                                            .analytic_color
+                                            .as_ref()
+                                            .expect("analytic pipeline must exist"),
+                                    );
+                                } else {
+                                    render_pass.set_pipeline(&pipelines.color_fill);
+                                }
                             }
                             DrawType::Gradient { bind_group } => {
-                                render_pass.set_pipeline(&pipelines.gradient_fill);
+                                if draw.analytic_bind_group.is_some()
+                                    && pipelines.analytic_gradient.is_some()
+                                {
+                                    render_pass.set_pipeline(
+                                        pipelines
+                                            .analytic_gradient
+                                            .as_ref()
+                                            .expect("analytic pipeline must exist"),
+                                    );
+                                } else {
+                                    render_pass.set_pipeline(&pipelines.gradient_fill);
+                                }
                                 render_pass.set_bind_group(2, bind_group, &[]);
                             }
                             DrawType::Bitmap { bind_group } => {
-                                render_pass.set_pipeline(&pipelines.bitmap_fill);
+                                if draw.analytic_bind_group.is_some()
+                                    && pipelines.analytic_bitmap.is_some()
+                                {
+                                    render_pass.set_pipeline(
+                                        pipelines
+                                            .analytic_bitmap
+                                            .as_ref()
+                                            .expect("analytic pipeline must exist"),
+                                    );
+                                } else {
+                                    render_pass.set_pipeline(&pipelines.bitmap_fill);
+                                }
                                 render_pass.set_bind_group(2, bind_group, &[]);
+                            }
+                        }
+
+                        if let Some(analytic_bind_group) = &draw.analytic_bind_group {
+                            let analytic_available = match &draw.draw_type {
+                                DrawType::Color => pipelines.analytic_color.is_some(),
+                                DrawType::Gradient { .. } => pipelines.analytic_gradient.is_some(),
+                                DrawType::Bitmap { .. } => pipelines.analytic_bitmap.is_some(),
+                            };
+                            if analytic_available {
+                                let analytic_group = match &draw.draw_type {
+                                    DrawType::Color => 2,
+                                    DrawType::Gradient { .. } | DrawType::Bitmap { .. } => 3,
+                                };
+                                render_pass.set_bind_group(analytic_group, analytic_bind_group, &[]);
                             }
                         }
 

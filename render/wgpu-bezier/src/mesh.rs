@@ -31,7 +31,9 @@
 use crate::{BezierTexVertex, BezierVertex, GradientUniforms, TextureTransforms};
 use ruffle_render::backend::{ShapeHandle, ShapeHandleImpl};
 use ruffle_render::bitmap::BitmapHandle;
-use ruffle_render::shape_utils::{DistilledShape, DrawCommand, DrawPath, GradientType};
+use ruffle_render::shape_utils::{
+    DistilledShape, DrawCommand, DrawPath, FillRule, GradientType,
+};
 use std::any::Any;
 use std::collections::HashMap;
 use swf::{FillStyle, GradientRecord, LineCapStyle, LineJoinStyle, LineStyle, Twips};
@@ -65,6 +67,51 @@ pub struct Draw {
     /// True when this draw comes from `DrawPath::Stroke`.
     /// Mask rendering should ignore stroke draws and only use fill geometry.
     pub is_stroke: bool,
+    /// Fill rule for this draw when `is_stroke == false`.
+    pub fill_rule: Option<FillRule>,
+    /// Analytic path payload for future winding-correct GPU fill evaluation.
+    ///
+    /// Phase 1 only stores/uploads this data; later passes will consume it in
+    /// dedicated analytic fill/stroke pipelines.
+    pub analytic_fill: Option<AnalyticFillData>,
+    /// Analytic stroke payload for future direct GPU stroke rendering.
+    pub analytic_stroke: Option<AnalyticStrokeData>,
+    /// Bind group containing analytic segment buffer and params uniform.
+    pub analytic_bind_group: Option<wgpu::BindGroup>,
+}
+
+/// One quadratic segment for analytic fill/stroke evaluation on GPU.
+///
+/// For line segments, `control` is set to the midpoint of `start` and `end`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuQuadraticSegment {
+    pub start: [f32; 2],
+    pub control: [f32; 2],
+    pub end: [f32; 2],
+    pub _pad0: [f32; 2],
+}
+
+/// Preprocessed analytic fill data for one `DrawPath::Fill` path.
+#[derive(Clone, Debug)]
+pub struct AnalyticFillData {
+    pub segment_buffer: wgpu::Buffer,
+    pub num_segments: u32,
+    /// Path bounds in object-space pixels: [min_x, min_y, max_x, max_y].
+    pub bounds: [f32; 4],
+}
+
+/// Preprocessed analytic stroke data for one `DrawPath::Stroke` path.
+#[derive(Clone, Debug)]
+pub struct AnalyticStrokeData {
+    pub segment_buffer: wgpu::Buffer,
+    pub num_segments: u32,
+    pub bounds: [f32; 4],
+    pub half_width: f32,
+    pub is_closed: bool,
+    pub start_cap: LineCapStyle,
+    pub end_cap: LineCapStyle,
+    pub join_style: LineJoinStyle,
 }
 
 /// What kind of fill this draw uses.
@@ -93,6 +140,7 @@ pub fn build_mesh(
     bitmap_handles: &HashMap<u16, BitmapHandle>,
     gradient_layout: &wgpu::BindGroupLayout,
     bitmap_layout: &wgpu::BindGroupLayout,
+    analytic_layout: Option<&wgpu::BindGroupLayout>,
     default_sampler: &wgpu::Sampler,
 ) -> BezierMesh {
     let mut draws = Vec::new();
@@ -100,17 +148,21 @@ pub fn build_mesh(
     for path in &shape.paths {
         match path {
             DrawPath::Fill {
-                style, commands, ..
+                style,
+                commands,
+                winding_rule,
             } => {
                 let draw = build_fill_draw(
                     device,
                     queue,
                     commands,
+                    *winding_rule,
                     style,
                     shape.id,
                     bitmap_handles,
                     gradient_layout,
                     bitmap_layout,
+                    analytic_layout,
                     default_sampler,
                 );
                 if let Some(draw) = draw {
@@ -132,6 +184,7 @@ pub fn build_mesh(
                     bitmap_handles,
                     gradient_layout,
                     bitmap_layout,
+                    analytic_layout,
                     default_sampler,
                 );
                 if let Some(draw) = draw {
@@ -152,11 +205,13 @@ fn build_fill_draw(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     commands: &[DrawCommand],
+    winding_rule: FillRule,
     style: &FillStyle,
     _shape_id: swf::CharacterId,
     bitmap_handles: &HashMap<u16, BitmapHandle>,
     gradient_layout: &wgpu::BindGroupLayout,
     bitmap_layout: &wgpu::BindGroupLayout,
+    analytic_layout: Option<&wgpu::BindGroupLayout>,
     default_sampler: &wgpu::Sampler,
 ) -> Option<Draw> {
     if commands.is_empty() {
@@ -171,6 +226,23 @@ fn build_fill_draw(
         FillStyle::Bitmap { .. } => (FillKind::Bitmap, false),
     };
 
+    let maybe_analytic = if let Some(analytic_layout) = analytic_layout {
+        let analytic_fill = build_analytic_fill_data(device, commands)?;
+        let analytic_bind_group = create_analytic_bind_group(
+            device,
+            analytic_layout,
+            &analytic_fill.segment_buffer,
+            analytic_fill.num_segments,
+            analytic_fill.bounds,
+            0,
+            winding_rule,
+            0.0,
+        );
+        Some((analytic_fill, analytic_bind_group))
+    } else {
+        None
+    };
+
     if use_color_vertices {
         let color = match style {
             FillStyle::Color(c) => *c,
@@ -183,7 +255,11 @@ fn build_fill_draw(
             f32::from(color.a) / 255.0,
         ];
 
-        let (vertices, indices) = build_fill_geometry_color(commands, color_f);
+        let (vertices, indices) = if let Some((analytic_fill, _)) = &maybe_analytic {
+            build_analytic_quad_color(analytic_fill.bounds, color_f)
+        } else {
+            build_fill_geometry_color(commands, color_f)
+        };
 
         if indices.is_empty() {
             return None;
@@ -206,9 +282,17 @@ fn build_fill_draw(
             index_buffer,
             num_indices: indices.len() as u32,
             is_stroke: false,
+            fill_rule: Some(winding_rule),
+            analytic_fill: maybe_analytic.as_ref().map(|(fill, _)| fill.clone()),
+            analytic_stroke: None,
+            analytic_bind_group: maybe_analytic.map(|(_, bg)| bg),
         })
     } else {
-        let (vertices, indices) = build_fill_geometry_tex(commands);
+        let (vertices, indices) = if let Some((analytic_fill, _)) = &maybe_analytic {
+            build_analytic_quad_tex(analytic_fill.bounds)
+        } else {
+            build_fill_geometry_tex(commands)
+        };
 
         if indices.is_empty() {
             return None;
@@ -343,6 +427,10 @@ fn build_fill_draw(
             index_buffer,
             num_indices: indices.len() as u32,
             is_stroke: false,
+            fill_rule: Some(winding_rule),
+            analytic_fill: maybe_analytic.as_ref().map(|(fill, _)| fill.clone()),
+            analytic_stroke: None,
+            analytic_bind_group: maybe_analytic.map(|(_, bg)| bg),
         })
     }
 }
@@ -713,23 +801,52 @@ fn build_stroke_draw(
     bitmap_handles: &HashMap<u16, BitmapHandle>,
     gradient_layout: &wgpu::BindGroupLayout,
     bitmap_layout: &wgpu::BindGroupLayout,
+    analytic_layout: Option<&wgpu::BindGroupLayout>,
     default_sampler: &wgpu::Sampler,
 ) -> Option<Draw> {
     let width = style.width();
-    let half_width = width.to_pixels() as f32 / 2.0;
     // Flash draws hairline strokes at 1px minimum.
-    let half_width = if half_width <= 0.0 { 0.5 } else { half_width };
+    let half_width = (width.to_pixels() as f32 / 2.0).max(0.5);
 
     let fill_style = style.fill_style();
     let start_cap = style.start_cap();
     let end_cap = style.end_cap();
     let join_style = style.join_style();
 
-    // Flatten all commands into sub-path polylines.
-    let sub_paths = flatten_commands_to_polylines(commands);
-    if sub_paths.is_empty() {
-        return None;
-    }
+    // The current analytic stroke shader models stroke coverage as distance to
+    // the curve set, which naturally matches round caps/joins. For other cap/join
+    // styles, keep classic mesh expansion for better parity.
+    let supports_analytic_stroke_style = matches!(start_cap, LineCapStyle::Round)
+        && matches!(end_cap, LineCapStyle::Round)
+        && matches!(join_style, LineJoinStyle::Round);
+
+    let maybe_analytic = if let Some(analytic_layout) = analytic_layout
+        && supports_analytic_stroke_style
+    {
+        let analytic_stroke = build_analytic_stroke_data(
+            device,
+            commands,
+            half_width,
+            is_closed,
+            start_cap,
+            end_cap,
+            join_style,
+        )?;
+
+        let analytic_bind_group = create_analytic_bind_group(
+            device,
+            analytic_layout,
+            &analytic_stroke.segment_buffer,
+            analytic_stroke.num_segments,
+            analytic_stroke.bounds,
+            1,
+            FillRule::EvenOdd,
+            half_width,
+        );
+        Some((analytic_stroke, analytic_bind_group))
+    } else {
+        None
+    };
 
     let use_color_vertices = matches!(fill_style, FillStyle::Color(_));
 
@@ -744,16 +861,27 @@ fn build_stroke_draw(
             _ => unreachable!(),
         };
 
-        let mut vertices: Vec<BezierVertex> = Vec::new();
-        let mut indices: Vec<u32> = Vec::new();
-
-        for path in &sub_paths {
-            expand_stroke_path_color(
-                path, half_width, color, is_closed,
-                start_cap, end_cap, join_style,
-                &mut vertices, &mut indices,
-            );
-        }
+        let (vertices, indices) = if let Some((analytic_stroke, _)) = &maybe_analytic {
+            build_analytic_quad_color(analytic_stroke.bounds, color)
+        } else {
+            let mut vertices: Vec<BezierVertex> = Vec::new();
+            let mut indices: Vec<u32> = Vec::new();
+            let sub_paths = flatten_commands_to_polylines(commands);
+            for path in &sub_paths {
+                expand_stroke_path_color(
+                    path,
+                    half_width,
+                    color,
+                    is_closed,
+                    start_cap,
+                    end_cap,
+                    join_style,
+                    &mut vertices,
+                    &mut indices,
+                );
+            }
+            (vertices, indices)
+        };
 
         if indices.is_empty() {
             return None;
@@ -776,19 +904,33 @@ fn build_stroke_draw(
             index_buffer,
             num_indices: indices.len() as u32,
             is_stroke: true,
+            fill_rule: None,
+            analytic_fill: None,
+            analytic_stroke: maybe_analytic.as_ref().map(|(stroke, _)| stroke.clone()),
+            analytic_bind_group: maybe_analytic.map(|(_, bg)| bg),
         })
     } else {
         // Gradient or bitmap stroke: use BezierTexVertex.
-        let mut vertices: Vec<BezierTexVertex> = Vec::new();
-        let mut indices: Vec<u32> = Vec::new();
-
-        for path in &sub_paths {
-            expand_stroke_path_tex(
-                path, half_width, is_closed,
-                start_cap, end_cap, join_style,
-                &mut vertices, &mut indices,
-            );
-        }
+        let (vertices, indices) = if let Some((analytic_stroke, _)) = &maybe_analytic {
+            build_analytic_quad_tex(analytic_stroke.bounds)
+        } else {
+            let mut vertices: Vec<BezierTexVertex> = Vec::new();
+            let mut indices: Vec<u32> = Vec::new();
+            let sub_paths = flatten_commands_to_polylines(commands);
+            for path in &sub_paths {
+                expand_stroke_path_tex(
+                    path,
+                    half_width,
+                    is_closed,
+                    start_cap,
+                    end_cap,
+                    join_style,
+                    &mut vertices,
+                    &mut indices,
+                );
+            }
+            (vertices, indices)
+        };
 
         if indices.is_empty() {
             return None;
@@ -899,8 +1041,279 @@ fn build_stroke_draw(
             index_buffer,
             num_indices: indices.len() as u32,
             is_stroke: true,
+            fill_rule: None,
+            analytic_fill: None,
+            analytic_stroke: maybe_analytic.as_ref().map(|(stroke, _)| stroke.clone()),
+            analytic_bind_group: maybe_analytic.map(|(_, bg)| bg),
         })
     }
+}
+
+fn build_analytic_quad_color(bounds: [f32; 4], color: [f32; 4]) -> (Vec<BezierVertex>, Vec<u32>) {
+    let [min_x, min_y, max_x, max_y] = bounds;
+    let vertices = vec![
+        BezierVertex { position: [min_x, min_y], uv: [0.0, 0.0], fill_type: 0, color, _pad: 0 },
+        BezierVertex { position: [max_x, min_y], uv: [0.0, 0.0], fill_type: 0, color, _pad: 0 },
+        BezierVertex { position: [max_x, max_y], uv: [0.0, 0.0], fill_type: 0, color, _pad: 0 },
+        BezierVertex { position: [min_x, max_y], uv: [0.0, 0.0], fill_type: 0, color, _pad: 0 },
+    ];
+    let indices = vec![0, 1, 2, 0, 2, 3];
+    (vertices, indices)
+}
+
+fn build_analytic_quad_tex(bounds: [f32; 4]) -> (Vec<BezierTexVertex>, Vec<u32>) {
+    let [min_x, min_y, max_x, max_y] = bounds;
+    let vertices = vec![
+        BezierTexVertex { position: [min_x, min_y], uv: [0.0, 0.0], fill_type: 0, _pad: 0 },
+        BezierTexVertex { position: [max_x, min_y], uv: [0.0, 0.0], fill_type: 0, _pad: 0 },
+        BezierTexVertex { position: [max_x, max_y], uv: [0.0, 0.0], fill_type: 0, _pad: 0 },
+        BezierTexVertex { position: [min_x, max_y], uv: [0.0, 0.0], fill_type: 0, _pad: 0 },
+    ];
+    let indices = vec![0, 1, 2, 0, 2, 3];
+    (vertices, indices)
+}
+
+fn create_analytic_bind_group(
+    device: &wgpu::Device,
+    analytic_layout: &wgpu::BindGroupLayout,
+    segment_buffer: &wgpu::Buffer,
+    num_segments: u32,
+    bounds: [f32; 4],
+    mode: u32,
+    fill_rule: FillRule,
+    half_width: f32,
+) -> wgpu::BindGroup {
+    let params = crate::AnalyticParams {
+        bounds,
+        num_segments,
+        mode,
+        fill_rule: match fill_rule {
+            FillRule::EvenOdd => 0,
+            FillRule::NonZero => 1,
+        },
+        half_width,
+        cap_join_flags: 0,
+        _pad0: [0, 0, 0],
+    };
+    let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Analytic params"),
+        contents: bytemuck::bytes_of(&params),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Analytic bind group"),
+        layout: analytic_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: segment_buffer,
+                    offset: 0,
+                    size: None,
+                }),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: params_buffer.as_entire_binding(),
+            },
+        ],
+    })
+}
+
+fn build_analytic_stroke_data(
+    device: &wgpu::Device,
+    commands: &[DrawCommand],
+    half_width: f32,
+    is_closed: bool,
+    start_cap: LineCapStyle,
+    end_cap: LineCapStyle,
+    join_style: LineJoinStyle,
+) -> Option<AnalyticStrokeData> {
+    let (segments, bounds) = collect_quadratic_segments(commands);
+    if segments.is_empty() {
+        return None;
+    }
+
+    let expanded_bounds = [
+        bounds[0] - half_width,
+        bounds[1] - half_width,
+        bounds[2] + half_width,
+        bounds[3] + half_width,
+    ];
+
+    let segment_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Analytic stroke segments"),
+        contents: bytemuck::cast_slice(&segments),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+
+    Some(AnalyticStrokeData {
+        segment_buffer,
+        num_segments: segments.len() as u32,
+        bounds: expanded_bounds,
+        half_width,
+        is_closed,
+        start_cap,
+        end_cap,
+        join_style,
+    })
+}
+
+/// Build/upload analytic quadratic segments and path bounds for a fill path.
+fn build_analytic_fill_data(
+    device: &wgpu::Device,
+    commands: &[DrawCommand],
+) -> Option<AnalyticFillData> {
+    let (segments, bounds) = collect_quadratic_segments(commands);
+    if segments.is_empty() {
+        return None;
+    }
+
+    let segment_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Analytic fill segments"),
+        contents: bytemuck::cast_slice(&segments),
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+    });
+
+    Some(AnalyticFillData {
+        segment_buffer,
+        num_segments: segments.len() as u32,
+        bounds,
+    })
+}
+
+/// Convert draw commands into a list of oriented quadratic segments and bounds.
+fn collect_quadratic_segments(commands: &[DrawCommand]) -> (Vec<GpuQuadraticSegment>, [f32; 4]) {
+    let mut segments = Vec::new();
+
+    let mut min_x = f32::INFINITY;
+    let mut min_y = f32::INFINITY;
+    let mut max_x = f32::NEG_INFINITY;
+    let mut max_y = f32::NEG_INFINITY;
+
+    let mut cursor: Option<[f32; 2]> = None;
+    let mut subpath_start: Option<[f32; 2]> = None;
+
+    let mut include = |p: [f32; 2]| {
+        min_x = min_x.min(p[0]);
+        min_y = min_y.min(p[1]);
+        max_x = max_x.max(p[0]);
+        max_y = max_y.max(p[1]);
+    };
+
+    let push_line_as_quad = |from: [f32; 2], to: [f32; 2], out: &mut Vec<GpuQuadraticSegment>| {
+        let control = [(from[0] + to[0]) * 0.5, (from[1] + to[1]) * 0.5];
+        out.push(GpuQuadraticSegment {
+            start: from,
+            control,
+            end: to,
+            _pad0: [0.0, 0.0],
+        });
+    };
+
+    for cmd in commands {
+        match cmd {
+            DrawCommand::MoveTo(pt) => {
+                let p = [pt.x.to_pixels() as f32, pt.y.to_pixels() as f32];
+
+                // Close previous subpath if needed.
+                if let (Some(start), Some(cur)) = (subpath_start, cursor) {
+                    if start != cur {
+                        push_line_as_quad(cur, start, &mut segments);
+                        include(start);
+                    }
+                }
+
+                cursor = Some(p);
+                subpath_start = Some(p);
+                include(p);
+            }
+            DrawCommand::LineTo(pt) => {
+                let to = [pt.x.to_pixels() as f32, pt.y.to_pixels() as f32];
+                if let Some(from) = cursor {
+                    push_line_as_quad(from, to, &mut segments);
+                    include(from);
+                    include(to);
+                    cursor = Some(to);
+                }
+            }
+            DrawCommand::QuadraticCurveTo { control, anchor } => {
+                let c = [control.x.to_pixels() as f32, control.y.to_pixels() as f32];
+                let a = [anchor.x.to_pixels() as f32, anchor.y.to_pixels() as f32];
+                if let Some(from) = cursor {
+                    segments.push(GpuQuadraticSegment {
+                        start: from,
+                        control: c,
+                        end: a,
+                        _pad0: [0.0, 0.0],
+                    });
+                    include(from);
+                    include(c);
+                    include(a);
+                    cursor = Some(a);
+                }
+            }
+            DrawCommand::CubicCurveTo {
+                control_a,
+                control_b,
+                anchor,
+            } => {
+                // Phase 1 fallback: flatten cubic to line-as-quadratic segments.
+                let Some(from) = cursor else { continue };
+
+                let steps = 16;
+                let mut prev = from;
+                for i in 1..=steps {
+                    let t = i as f32 / steps as f32;
+                    let mt = 1.0 - t;
+                    let mt2 = mt * mt;
+                    let mt3 = mt2 * mt;
+                    let t2 = t * t;
+                    let t3 = t2 * t;
+
+                    let p = [
+                        mt3 * from[0]
+                            + 3.0 * mt2 * t * control_a.x.to_pixels() as f32
+                            + 3.0 * mt * t2 * control_b.x.to_pixels() as f32
+                            + t3 * anchor.x.to_pixels() as f32,
+                        mt3 * from[1]
+                            + 3.0 * mt2 * t * control_a.y.to_pixels() as f32
+                            + 3.0 * mt * t2 * control_b.y.to_pixels() as f32
+                            + t3 * anchor.y.to_pixels() as f32,
+                    ];
+
+                    push_line_as_quad(prev, p, &mut segments);
+                    include(prev);
+                    include(p);
+                    prev = p;
+                }
+                cursor = Some(prev);
+            }
+        }
+    }
+
+    // Close final subpath if needed.
+    if let (Some(start), Some(cur)) = (subpath_start, cursor) {
+        if start != cur {
+            let control = [(cur[0] + start[0]) * 0.5, (cur[1] + start[1]) * 0.5];
+            segments.push(GpuQuadraticSegment {
+                start: cur,
+                control,
+                end: start,
+                _pad0: [0.0, 0.0],
+            });
+            include(start);
+        }
+    }
+
+    let bounds = if min_x.is_finite() {
+        [min_x, min_y, max_x, max_y]
+    } else {
+        [0.0, 0.0, 0.0, 0.0]
+    };
+
+    (segments, bounds)
 }
 
 /// Flatten DrawCommands into polyline sub-paths.

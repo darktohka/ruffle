@@ -78,6 +78,7 @@
 #![allow(dead_code)]
 
 pub mod backend;
+pub mod blend;
 mod mesh;
 mod pipelines;
 mod shaders;

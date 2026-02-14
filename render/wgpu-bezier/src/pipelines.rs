@@ -10,8 +10,10 @@
 //! - **DrawMaskStencil**: Writes to stencil only (no color output).
 //! - **ClearMaskStencil**: Decrements stencil (no color output).
 
+use crate::blend::ComplexBlend;
 use crate::shaders::Shaders;
 use crate::{BezierTexVertex, BezierVertex, MaskState};
+use enum_map::{EnumMap, enum_map};
 
 /// Bind group layouts used by the Bézier renderer.
 #[derive(Debug)]
@@ -26,6 +28,8 @@ pub struct BindLayouts {
     pub bitmap: wgpu::BindGroupLayout,
     /// Layout for RenderBitmap (texture + sampler only).
     pub render_bitmap: wgpu::BindGroupLayout,
+    /// Layout for complex blend compositing (parent_texture + current_texture + sampler).
+    pub blend: wgpu::BindGroupLayout,
 }
 
 impl BindLayouts {
@@ -164,12 +168,48 @@ impl BindLayouts {
             ],
         });
 
+        let blend = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Bezier blend layout"),
+            entries: &[
+                // binding 0: parent (background) texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                // binding 1: current (foreground) texture
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                // binding 2: sampler
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
         Self {
             globals,
             transforms,
             gradient,
             bitmap,
             render_bitmap,
+            blend,
         }
     }
 }
@@ -198,6 +238,8 @@ pub struct Pipelines {
     pub draw_masked_content: PipelineSet,
     /// Pipelines for clearing the stencil buffer (decrementing).
     pub clear_mask_stencil: PipelineSet,
+    /// Complex blend mode compositing pipelines (one per ComplexBlend variant).
+    pub complex_blend: EnumMap<ComplexBlend, wgpu::RenderPipeline>,
 }
 
 impl Pipelines {
@@ -208,6 +250,13 @@ impl Pipelines {
         sample_count: u32,
         layouts: &BindLayouts,
     ) -> Self {
+        let complex_blend = create_complex_blend_pipelines(
+            device,
+            shaders,
+            format,
+            &layouts.blend,
+        );
+
         Self {
             no_mask: create_pipeline_set(
                 device, shaders, format, sample_count, layouts,
@@ -225,6 +274,7 @@ impl Pipelines {
                 device, shaders, format, sample_count, layouts,
                 MaskState::ClearMaskStencil,
             ),
+            complex_blend,
         }
     }
 
@@ -508,5 +558,56 @@ fn create_pipeline_set(
         gradient_fill,
         bitmap_fill,
         render_bitmap,
+    }
+}
+
+/// Create complex blend mode compositing pipelines.
+/// These use full-screen triangles generated from vertex_index (no vertex buffers).
+/// They composite a foreground texture onto a background texture using the blend shader.
+fn create_complex_blend_pipelines(
+    device: &wgpu::Device,
+    shaders: &Shaders,
+    format: wgpu::TextureFormat,
+    blend_layout: &wgpu::BindGroupLayout,
+) -> EnumMap<ComplexBlend, wgpu::RenderPipeline> {
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Bezier complex blend layout"),
+        bind_group_layouts: &[blend_layout],
+        push_constant_ranges: &[],
+    });
+
+    enum_map! {
+        blend => {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(&format!("Bezier complex blend: {blend:?}")),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shaders.blend_shaders[blend],
+                    entry_point: Some("main_vertex"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shaders.blend_shaders[blend],
+                    entry_point: Some("main_fragment"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
+        }
     }
 }

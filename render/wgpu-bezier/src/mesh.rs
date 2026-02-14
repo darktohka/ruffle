@@ -272,7 +272,11 @@ fn build_fill_draw(
                         <dyn Any>::downcast_ref(&*handle.0).expect("Must be a Texture");
                     let texture_view = texture.texture.create_view(&Default::default());
 
-                    let tex_matrix = swf_to_gl_matrix((*matrix).into());
+                    let tex_matrix = swf_bitmap_to_gl_matrix(
+                        (*matrix).into(),
+                        texture.texture.width(),
+                        texture.texture.height(),
+                    );
                     let tex_transforms_data = TextureTransforms {
                         u_matrix: matrix_3x3_to_4x4(&tex_matrix),
                     };
@@ -823,7 +827,11 @@ fn build_stroke_draw(
                         <dyn Any>::downcast_ref(&*handle.0).expect("Must be a Texture");
                     let texture_view = texture.texture.create_view(&Default::default());
 
-                    let tex_matrix = swf_to_gl_matrix((*matrix).into());
+                    let tex_matrix = swf_bitmap_to_gl_matrix(
+                        (*matrix).into(),
+                        texture.texture.width(),
+                        texture.texture.height(),
+                    );
                     let tex_transforms_data = TextureTransforms {
                         u_matrix: matrix_3x3_to_4x4(&tex_matrix),
                     };
@@ -1644,32 +1652,85 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t) as u8
 }
 
-/// Convert a SWF matrix into a 3x3 GL-style texture transform matrix.
+/// Convert a SWF gradient matrix into a 3x3 GL-style texture transform matrix.
 ///
-/// The SWF gradient/bitmap coordinate space uses a 32768×32768 space
+/// The SWF gradient coordinate space uses a 32768×32768 space
 /// (-16384 to +16384 twips). This matrix converts from object-space
-/// twips into that normalized 0..1 UV space.
+/// pixels into normalized 0..1 UV space.
+///
+/// The factor of 20 converts the inverse matrix from "per twip" to
+/// "per pixel" (since vertex positions in the shader are in pixels but
+/// tx/ty are in raw twips). The 32768 normalizes to the gradient box.
+/// The +0.5 centers the gradient in [0,1] UV space.
+#[expect(clippy::many_single_char_names)]
 fn swf_to_gl_matrix(m: ruffle_render::matrix::Matrix) -> [[f32; 3]; 3] {
     let tx = m.tx.get() as f32;
     let ty = m.ty.get() as f32;
-    let det = m.a * m.d - m.b * m.c;
+    let det = m.a * m.d - m.c * m.b;
     if det.abs() < 1e-10 {
         // Degenerate matrix; return identity.
         return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     }
-    let inv_det = 1.0 / det;
-    let a = m.d * inv_det;
-    let b = -m.b * inv_det;
-    let c = -m.c * inv_det;
-    let d = m.a * inv_det;
-    let out_tx = -(a * tx + c * ty);
-    let out_ty = -(b * tx + d * ty);
+    let mut a = m.d / det;
+    let mut b = -m.c / det;
+    let mut c = -(tx * m.d - m.c * ty) / det;
+    let mut d = -m.b / det;
+    let mut e = m.a / det;
+    let mut f = (tx * m.b - m.a * ty) / det;
 
-    [
-        [a, b, 0.0],
-        [c, d, 0.0],
-        [out_tx, out_ty, 1.0],
-    ]
+    // Scale 2x2 part: twips→pixels (20) and gradient-space normalization (32768).
+    a *= 20.0 / 32768.0;
+    b *= 20.0 / 32768.0;
+    d *= 20.0 / 32768.0;
+    e *= 20.0 / 32768.0;
+
+    // Translation: normalize and center in [0,1].
+    c /= 32768.0;
+    f /= 32768.0;
+    c += 0.5;
+    f += 0.5;
+
+    [[a, d, 0.0], [b, e, 0.0], [c, f, 1.0]]
+}
+
+/// Convert a SWF bitmap matrix into a 3x3 GL-style texture transform matrix.
+///
+/// Similar to `swf_to_gl_matrix` but normalizes by bitmap pixel dimensions
+/// instead of the gradient box size. No +0.5 centering offset because the
+/// bitmap origin is at the corner, not the center.
+#[expect(clippy::many_single_char_names)]
+fn swf_bitmap_to_gl_matrix(
+    m: ruffle_render::matrix::Matrix,
+    bitmap_width: u32,
+    bitmap_height: u32,
+) -> [[f32; 3]; 3] {
+    let bitmap_width = bitmap_width as f32;
+    let bitmap_height = bitmap_height as f32;
+
+    let tx = m.tx.get() as f32;
+    let ty = m.ty.get() as f32;
+    let det = m.a * m.d - m.c * m.b;
+    if det.abs() < 1e-10 {
+        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    }
+    let mut a = m.d / det;
+    let mut b = -m.c / det;
+    let mut c = -(tx * m.d - m.c * ty) / det;
+    let mut d = -m.b / det;
+    let mut e = m.a / det;
+    let mut f = (tx * m.b - m.a * ty) / det;
+
+    // Scale 2x2 part: twips→pixels (20) and bitmap-dimension normalization.
+    a *= 20.0 / bitmap_width;
+    b *= 20.0 / bitmap_width;
+    d *= 20.0 / bitmap_height;
+    e *= 20.0 / bitmap_height;
+
+    // Translation: normalize by bitmap dimensions (no centering offset).
+    c /= bitmap_width;
+    f /= bitmap_height;
+
+    [[a, d, 0.0], [b, e, 0.0], [c, f, 1.0]]
 }
 
 fn matrix_3x3_to_4x4(m: &[[f32; 3]; 3]) -> [[f32; 4]; 4] {

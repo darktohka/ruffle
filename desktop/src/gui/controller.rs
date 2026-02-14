@@ -11,9 +11,8 @@ use fontdb::{Database, Family, Query, Source};
 use ruffle_core::events::{ImeCursorArea, ImePurpose};
 use ruffle_core::{Player, PlayerEvent};
 use ruffle_frontend_utils::content::ContentDescriptor;
-use ruffle_render_wgpu::backend::{
-    WgpuRenderBackend, create_wgpu_instance, request_adapter_and_device,
-};
+use ruffle_render_wgpu_bezier::backend::BezierRenderBackend;
+use ruffle_render_wgpu::backend::{create_wgpu_instance, request_adapter_and_device};
 use ruffle_render_wgpu::descriptors::Descriptors;
 use ruffle_render_wgpu::utils::{format_list, get_backend_names};
 use std::any::Any;
@@ -405,7 +404,7 @@ impl GuiController {
 
         let movie_view = if let Some(player) = player.as_deref_mut() {
             let renderer =
-                <dyn Any>::downcast_ref::<WgpuRenderBackend<MovieView>>(player.renderer_mut())
+                <dyn Any>::downcast_ref::<BezierRenderBackend<MovieView>>(player.renderer_mut())
                     .expect("Renderer must be correct type");
             Some(renderer.target())
         } else {

@@ -1,3 +1,113 @@
+//! # Canvas Render Backend for Ruffle
+//!
+//! This module implements Ruffle's [`RenderBackend`] trait using the browser's
+//! HTML5 Canvas 2D rendering context (`CanvasRenderingContext2d`).
+//!
+//! ## Architecture Overview
+//!
+//! The Canvas renderer is a **high-level, retained-mode** backend that converts
+//! SWF vector shapes into browser-native `Path2d` objects and then draws them
+//! using the Canvas 2D API. This approach relies entirely on the browser's
+//! built-in path rasterizer for anti-aliasing, curve rendering, and compositing.
+//!
+//! ## Rendering Pipeline
+//!
+//! The pipeline has two main phases:
+//!
+//! ### 1. Shape Registration (`register_shape`)
+//!
+//! When a shape is first encountered, [`swf_shape_to_canvas_commands`] converts
+//! the SWF's [`DistilledShape`] (a list of [`DrawPath`](ruffle_render::shape_utils::DrawPath)
+//! entries — fills and strokes) into a cached list of [`CanvasDrawCommand`]s:
+//!
+//! - **Fills** become `CanvasDrawCommand::Fill { path, fill_style }`, where:
+//!   - The `path` is a [`Path2d`] built from the SWF's [`DrawCommand`] list
+//!     (MoveTo, LineTo, QuadraticCurveTo, CubicCurveTo).
+//!   - The `fill_style` is one of:
+//!     - [`CanvasFillStyle::Color`] — a solid RGBA color.
+//!     - [`CanvasFillStyle::Gradient`] — a `CanvasGradient` (linear or radial),
+//!       optionally with a [`GradientTransform`] for non-orthogonal matrices.
+//!     - [`CanvasFillStyle::Bitmap`] — a `CanvasPattern` created from a bitmap.
+//!
+//! - **Strokes** become `CanvasDrawCommand::Stroke { path, line_width, stroke_style, ... }`,
+//!   carrying the path plus line cap/join/miter/scale-mode parameters.
+//!
+//! All coordinates are converted from SWF "twips" (1/20 pixel) to pixels
+//! by applying a 1/20 scale via `bounds_viewbox_matrix`.
+//!
+//! ### 2. Frame Rendering (`submit_frame` → `CommandHandler` methods)
+//!
+//! Each frame, the player sends a [`CommandList`] that the backend executes via
+//! the [`CommandHandler`] trait. The key methods are:
+//!
+//! - **`render_shape`**: Iterates over the cached [`CanvasDrawCommand`]s and
+//!   issues Canvas API calls:
+//!   - For **fills**: sets the canvas transform to the object's world matrix,
+//!     applies the fill style, and calls `fill_with_path_2d_and_winding` using
+//!     the even-odd winding rule.
+//!   - For **strokes**: resets the canvas transform (to avoid distorting
+//!     stroke geometry like joins and endcaps), applies the object transform
+//!     *to the path itself* via `add_path_with_transformation`, then strokes
+//!     the transformed path with the correct line width, cap, and join settings.
+//!
+//! - **`render_bitmap`**: Draws a bitmap image via `draw_image_with_html_canvas_element`,
+//!   with the object's transform set on the canvas context.
+//!
+//! - **`draw_rect` / `draw_line` / `draw_line_rect`**: Draws simple geometric
+//!   primitives using pre-created unit `Path2d` objects (`self.rect`, `self.line`,
+//!   `self.line_rect`), transformed by the object's matrix.
+//!
+//! ## Color Transforms
+//!
+//! SWF color transforms (multiplicative RGBA + additive RGBA) are applied via:
+//! - **Alpha-only**: `context.set_global_alpha(...)` for simple alpha multipliers.
+//! - **Full color matrix**: An SVG `<feColorMatrix>` filter injected into the DOM
+//!   and applied via `context.set_filter("url('#_cm')")`.
+//!
+//! ## Masking
+//!
+//! Masking uses the Canvas clipping API:
+//! - `push_mask`: Begins collecting mask paths into a `Path2d` accumulator.
+//! - `activate_mask`: Applies the accumulated path as a clipping region via
+//!   `clip_with_path_2d_and_winding` (non-zero winding rule).
+//! - `pop_mask`: Restores the previous clipping state via `context.restore()`.
+//!
+//! ## Blend Modes
+//!
+//! Blend modes map to Canvas `globalCompositeOperation` values where possible
+//! (e.g., "multiply", "screen", "overlay"). Some Flash blend modes have no
+//! Canvas equivalent and fall back to "source-over".
+//!
+//! ## Gradient Handling
+//!
+//! Gradient transforms that involve skewing or non-uniform scaling are handled
+//! with a workaround: the *inverse* of the gradient transform is applied to the
+//! path, then the gradient transform is pushed to the canvas, resulting in the
+//! correct visual appearance even though Canvas doesn't support arbitrary
+//! gradient transformations natively.
+//!
+//! Gradient spread modes (reflect, repeat) are emulated by duplicating color
+//! stops, since Canvas doesn't support them natively either.
+//!
+//! ## Key Types
+//!
+//! | Type | Purpose |
+//! |------|---------|
+//! | [`WebCanvasRenderBackend`] | Main backend struct; owns the canvas context |
+//! | [`ShapeData`] | Cached draw commands for a registered shape |
+//! | [`CanvasDrawCommand`] | A single fill or stroke operation |
+//! | [`CanvasFillStyle`] | Color, gradient, or bitmap fill |
+//! | [`CanvasStrokeStyle`] | Color, gradient, or bitmap stroke |
+//! | [`MaskState`] | Tracks whether we're drawing content, a mask, or clearing a mask |
+//!
+//! ## Limitations
+//!
+//! - No Stage3D / Context3D support.
+//! - No PixelBender shader support.
+//! - No offscreen rendering or bitmap caching.
+//! - Bitmap fills use "no-repeat" instead of proper clamping.
+//! - Some blend modes (Subtract, Invert, Alpha, Erase) are not supported.
+
 #![deny(clippy::unwrap_used)]
 // Remove this when we start using `Rc` when compiling for wasm
 #![allow(clippy::arc_with_non_send_sync)]
@@ -28,18 +138,42 @@ use web_sys::{
     HtmlCanvasElement, ImageData, Path2d,
 };
 
+/// Threshold for determining if a gradient transform is "complex" (non-orthogonal).
+/// If the dot product of the gradient matrix columns exceeds this value,
+/// the transform involves skewing and must be handled with the inverse-path trick.
 const GRADIENT_TRANSFORM_THRESHOLD: f32 = 0.0001;
 
+/// The main Canvas 2D render backend.
+///
+/// Holds the HTML5 canvas element, its 2D rendering context, and all state
+/// needed to render SWF content. Shapes are pre-converted into [`Path2d`]
+/// objects at registration time and replayed each frame.
+///
+/// The backend maintains:
+/// - A **color matrix SVG filter** (`color_matrix`) for applying Flash color transforms.
+/// - Pre-built **unit-sized paths** (`rect`, `line`, `line_rect`) used as templates
+///   for simple geometry; these are transformed via the canvas context matrix.
+/// - A **mask state machine** ([`MaskState`]) tracking whether we're currently
+///   drawing content, accumulating a mask path, or clearing a mask.
+/// - A **blend mode stack** matching Flash's nested blend mode semantics.
 pub struct WebCanvasRenderBackend {
+    /// The underlying HTML `<canvas>` element.
     canvas: HtmlCanvasElement,
+    /// The 2D rendering context used for all draw operations.
     context: CanvasRenderingContext2d,
+    /// The SVG `<feColorMatrix>` element used to apply SWF color transforms.
     color_matrix: Element,
     viewport_width: u32,
     viewport_height: u32,
+    /// A unit rectangle path `[0,0]→[1,1]`, used for `draw_rect`.
     rect: Path2d,
+    /// A unit line path `[0,0]→[1,0]`, used for `draw_line`.
     line: Path2d,
+    /// A unit line-rectangle path (4 sides), used for `draw_line_rect`.
     line_rect: Path2d,
+    /// Current masking state.
     mask_state: MaskState,
+    /// Stack of active blend modes (maps to Canvas `globalCompositeOperation`).
     blend_modes: Vec<RenderBlendMode>,
 
     // This is currently unused - we just store it to report
@@ -893,7 +1027,18 @@ impl CommandHandler for WebCanvasRenderBackend {
     }
 }
 
-/// Convert a series of `DrawCommands` to a `Path2d` shape.
+/// Convert a series of [`DrawCommand`]s to a browser `Path2d` shape.
+///
+/// This is the core conversion from SWF vector data to Canvas-renderable paths.
+/// Each [`DrawCommand`] maps directly to a Canvas path operation:
+/// - [`DrawCommand::MoveTo`] → `path.move_to(x, y)`
+/// - [`DrawCommand::LineTo`] → `path.line_to(x, y)`
+/// - [`DrawCommand::QuadraticCurveTo`] → `path.quadratic_curve_to(cx, cy, ax, ay)`
+/// - [`DrawCommand::CubicCurveTo`] → `path.bezier_curve_to(c1x, c1y, c2x, c2y, ax, ay)`
+///
+/// Coordinates are in SWF twips (raw `i32` values from `Twips::get()`).
+/// The caller is responsible for applying the twips→pixels (÷20) conversion
+/// via a transform matrix.
 ///
 /// The path can be optionally closed by setting `is_closed` to `true`.
 ///
@@ -937,6 +1082,23 @@ fn draw_commands_to_path2d(commands: &[DrawCommand], is_closed: bool) -> Path2d 
     path
 }
 
+/// Converts a [`DistilledShape`] (SWF vector shape data) into a list of
+/// [`CanvasDrawCommand`]s that can be replayed each frame.
+///
+/// This is called once per shape during `register_shape`. The resulting
+/// commands are cached in [`ShapeData`] and reused every time the shape
+/// is rendered.
+///
+/// ## Processing steps
+///
+/// 1. Creates a `bounds_viewbox_matrix` that scales from twips to pixels (÷20).
+/// 2. Iterates over each [`DrawPath`] in the distilled shape:
+///    - **Fills**: Converts [`DrawCommand`]s to a `Path2d` via
+///      [`draw_commands_to_path2d`], applies the viewbox scale, then creates
+///      the appropriate [`CanvasFillStyle`] (color, gradient, or bitmap pattern).
+///    - **Strokes**: Same path conversion, but also captures line styling
+///      (width, cap, join, miter limit, scale mode) for later use.
+/// 3. Each completed path+style pair is pushed as a [`CanvasDrawCommand`].
 fn swf_shape_to_canvas_commands(
     shape: &DistilledShape,
     bitmap_source: &dyn BitmapSource,
@@ -1163,12 +1325,26 @@ fn create_radial_gradient(
     swf_to_canvas_gradient(gradient, transformed, create_fn)
 }
 
-/// Converts an SWF gradient to a canvas gradient.
+/// Converts an SWF gradient to a Canvas gradient, handling spread modes and complex transforms.
 ///
-/// If the SWF gradient has a "simple" transform, this is a direct translation to `CanvasGradient`.
-/// If transform is "complex" (skewing or non-uniform scaling), we have to do some trickery and
-/// transform the entire path, because canvas does not have a direct way to render a transformed
-/// gradient.
+/// ## Simple vs. Complex Transforms
+///
+/// If the SWF gradient has a "simple" transform (uniform scale + rotation only),
+/// this is a direct translation to `CanvasGradient` with endpoints/radii computed
+/// from the transformed gradient space.
+///
+/// If the transform is "complex" (involves skewing or non-uniform scaling), we
+/// have to do some trickery: the gradient is created in identity space, and at
+/// render time the path is transformed by the *inverse* of the gradient matrix
+/// while the canvas is transformed by the gradient matrix. This produces the
+/// correct visual result even though Canvas doesn't support arbitrary gradient
+/// transforms.
+///
+/// ## Spread Mode Emulation
+///
+/// Canvas doesn't support gradient spread modes (Reflect, Repeat), so we
+/// emulate them by repeating the color stops many times across the gradient
+/// range (up to `NUM_REPEATS = 25` cycles).
 fn swf_to_canvas_gradient(
     swf_gradient: &swf::Gradient,
     transformed: bool,

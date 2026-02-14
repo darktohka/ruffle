@@ -23,7 +23,7 @@ use ruffle_frontend_utils::player_options::PlayerOptions;
 use ruffle_frontend_utils::recents::Recent;
 use ruffle_render::backend::RenderBackend;
 use ruffle_render::quality::StageQuality;
-use ruffle_render_wgpu::backend::WgpuRenderBackend;
+use ruffle_render_wgpu_bezier::backend::BezierRenderBackend;
 use ruffle_render_wgpu::clap::PowerPreference;
 use ruffle_render_wgpu::descriptors::Descriptors;
 use std::borrow::Cow;
@@ -269,9 +269,13 @@ impl ActivePlayer {
             GameModePreference::Off => false,
         };
 
-        let renderer = WgpuRenderBackend::new(descriptors, movie_view)
+        let renderer = BezierRenderBackend::new(
+            descriptors.device.clone(), 
+            descriptors.queue.clone(),
+            movie_view
+        )
             .map_err(|e| anyhow!(e.to_string()))
-            .expect("Couldn't create wgpu rendering backend");
+            .expect("Couldn't create bezier rendering backend");
         RENDER_INFO.with(|i| *i.borrow_mut() = Some(renderer.debug_info().to_string()));
 
         if opt.player.dummy_external_interface.unwrap_or_default() {

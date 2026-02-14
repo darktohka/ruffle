@@ -1,6 +1,7 @@
 use crate::gui::MENU_HEIGHT;
 use ruffle_render_wgpu::descriptors::Descriptors;
-use ruffle_render_wgpu::target::{RenderTarget, RenderTargetFrame};
+use ruffle_render_wgpu::target::{RenderTarget as WgpuRenderTarget, RenderTargetFrame as WgpuRenderTargetFrame};
+use ruffle_render_wgpu_bezier::target::{RenderTarget, RenderTargetFrame};
 use std::borrow::Cow;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -213,6 +214,43 @@ impl MovieView {
     }
 }
 
+impl WgpuRenderTarget for MovieView {
+    type Frame = MovieViewFrame;
+
+    fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        *self = MovieView::new(self.renderer.clone(), device, width, height);
+    }
+
+    fn format(&self) -> wgpu::TextureFormat {
+        self.texture.format()
+    }
+
+    fn width(&self) -> u32 {
+        self.texture.width()
+    }
+
+    fn height(&self) -> u32 {
+        self.texture.height()
+    }
+
+    fn get_next_texture(&mut self) -> Result<Self::Frame, wgpu::SurfaceError> {
+        Ok(MovieViewFrame(
+            self.texture.create_view(&Default::default()),
+        ))
+    }
+
+    fn submit<I: IntoIterator<Item = wgpu::CommandBuffer>>(
+        &self,
+        _device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        command_buffers: I,
+        _frame: Self::Frame,
+    ) -> wgpu::SubmissionIndex {
+        queue.submit(command_buffers)
+    }
+}
+
+// Also implement the bezier backend's RenderTarget trait
 impl RenderTarget for MovieView {
     type Frame = MovieViewFrame;
 
@@ -251,6 +289,16 @@ impl RenderTarget for MovieView {
 
 #[derive(Debug)]
 pub struct MovieViewFrame(wgpu::TextureView);
+
+impl WgpuRenderTargetFrame for MovieViewFrame {
+    fn into_view(self) -> wgpu::TextureView {
+        self.0
+    }
+
+    fn view(&self) -> &wgpu::TextureView {
+        &self.0
+    }
+}
 
 impl RenderTargetFrame for MovieViewFrame {
     fn into_view(self) -> wgpu::TextureView {

@@ -22,6 +22,7 @@ fontdb = "0.23"
 ruffle_core = { path = "../core", features = ["audio", "clap", "mp3", "aac", "nellymoser", "default_compatibility_rules", "egui"] }
 ruffle_render = { path = "../render", features = ["clap"] }
 ruffle_render_wgpu = { path = "../render/wgpu", features = ["clap"] }
+ruffle_render_wgpu_bezier = { path = "../render/wgpu-bezier" }
 ruffle_video_software = { path = "../video/software", optional = true }
 ruffle_video_external = { path = "../video/external", features = ["openh264"], optional = true }
 ruffle_frontend_utils = { path = "../frontend-utils", features = ["cpal", "fs", "navigator"] }

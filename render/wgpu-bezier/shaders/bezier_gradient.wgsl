@@ -58,8 +58,8 @@ fn find_t(uv: vec2<f32>) -> f32 {
         let centered = uv * 2.0 - 1.0;
         var d: vec2<f32> = vec2<f32>(gradient.focal_point, 0.0) - centered;
         let l = length(d);
-        d = d / l;
-        return l / (sqrt(1.0 - gradient.focal_point * gradient.focal_point * d.y * d.y) + gradient.focal_point * d.x);
+        d = d / max(l, 1e-6);
+        return l / (sqrt(max(1.0 - gradient.focal_point * gradient.focal_point * d.y * d.y, 1e-6)) + gradient.focal_point * d.x);
     }
 }
 
@@ -81,11 +81,15 @@ fn main_fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         t = saturate(t);
     } else if (gradient.repeat == 2) {
         // Reflect
-        if (t < 0.0) { t = -t; }
-        if ((i32(t) & 1) == 0) {
-            t = fract(t);
+        var t_abs = abs(t);
+        // Guard integer conversion range for very large values.
+        t_abs = min(t_abs, 2147483000.0);
+        let whole = floor(t_abs);
+        let frac_t = fract(t_abs);
+        if ((i32(whole) & 1) == 0) {
+            t = frac_t;
         } else {
-            t = 1.0 - fract(t);
+            t = 1.0 - frac_t;
         }
     } else if (gradient.repeat == 3) {
         // Repeat

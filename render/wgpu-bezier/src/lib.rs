@@ -189,9 +189,12 @@ pub struct AnalyticParams {
     pub half_width: f32,
     /// Packed cap/join flags for future expansion.
     pub cap_join_flags: u32,
-    /// Reserved. Kept at 3 words so the struct size is 48 bytes, matching WGSL
+    /// Stroke `LineScaleMode` (matches SWF `allow_scale_x/y` flags):
+    /// 0 = None (never scale), 1 = Horizontal, 2 = Vertical, 3 = Both (default).
+    pub scale_mode: u32,
+    /// Reserved. Kept at 2 words so the struct size is 48 bytes, matching WGSL
     /// uniform layout rounding to 16-byte alignment.
-    pub _pad0: [u32; 3],
+    pub _pad0: [u32; 2],
 }
 
 /// A GPU texture owned by this backend.

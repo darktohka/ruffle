@@ -42,7 +42,7 @@ use wgpu::util::DeviceExt;
 
 /// Align a value to the given alignment.
 fn align_to(value: u32, alignment: u32) -> u32 {
-    ((value + alignment - 1) / alignment) * alignment
+    value.div_ceil(alignment) * alignment
 }
 
 /// Cached unit-geometry GPU buffers for DrawRect, DrawLine, DrawLineRect, and RenderBitmap.
@@ -588,10 +588,10 @@ impl<T: RenderTarget> RenderBackend for BezierRenderBackend<T> {
                 }
                 _ => None,
             };
-            if let Some(id) = fill_style {
-                if let Some(handle) = bitmap_source.bitmap_handle(id, self) {
-                    bitmap_handles.insert(id, handle);
-                }
+            if let Some(id) = fill_style
+                && let Some(handle) = bitmap_source.bitmap_handle(id, self)
+            {
+                bitmap_handles.insert(id, handle);
             }
         }
 
@@ -1026,8 +1026,8 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
                     maskee_commands,
                     mask_commands,
                 } => {
-                    self.collect_transforms(maskee_commands);
                     self.collect_transforms(mask_commands);
+                    self.collect_transforms(maskee_commands);
                 }
                 _ => {}
             }
@@ -1038,13 +1038,10 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
     fn has_complex_blends(&self, commands: &CommandList) -> bool {
         use ruffle_render::commands::Command;
         for cmd in &commands.commands {
-            match cmd {
-                Command::Blend(_, mode) => {
-                    if matches!(BlendType::from(mode.clone()), BlendType::Complex(_)) {
-                        return true;
-                    }
-                }
-                _ => {}
+            if let Command::Blend(_, mode) = cmd
+                && matches!(BlendType::from(mode.clone()), BlendType::Complex(_))
+            {
+                return true;
             }
         }
         false
@@ -1527,11 +1524,11 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
             // Find the next complex blend command starting from cmd_idx.
             let mut complex_at = None;
             for i in cmd_idx..commands.commands.len() {
-                if let Command::Blend(_, mode) = &commands.commands[i] {
-                    if matches!(BlendType::from(mode.clone()), BlendType::Complex(_)) {
-                        complex_at = Some(i);
-                        break;
-                    }
+                if let Command::Blend(_, mode) = &commands.commands[i]
+                    && matches!(BlendType::from(mode.clone()), BlendType::Complex(_))
+                {
+                    complex_at = Some(i);
+                    break;
                 }
             }
 
@@ -1596,8 +1593,9 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
                     }
                 }
 
-                if let Command::Blend(sub_commands, blend_mode) = &commands.commands[blend_idx] {
-                    if let BlendType::Complex(complex) = BlendType::from(blend_mode.clone()) {
+                if let Command::Blend(sub_commands, blend_mode) = &commands.commands[blend_idx]
+                    && let BlendType::Complex(complex) = BlendType::from(blend_mode.clone())
+                {
                         self.execute_complex_blend(
                             encoder,
                             target_view,
@@ -1608,7 +1606,6 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
                             mask_state,
                             num_masks,
                         );
-                    }
                 }
                 cmd_idx = blend_idx + 1;
             } else {

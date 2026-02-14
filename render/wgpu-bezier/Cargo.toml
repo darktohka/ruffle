@@ -19,6 +19,7 @@ bytemuck = { workspace = true, features = ["derive"] }
 enum-map = { workspace = true }
 swf = { path = "../../swf" }
 indexmap = { workspace = true }
+lyon_geom = "1.0.6"
 
 # desktop
 [target.'cfg(not(target_family = "wasm"))'.dependencies.futures]

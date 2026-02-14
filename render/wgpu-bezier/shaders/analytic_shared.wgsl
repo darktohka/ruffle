@@ -12,7 +12,9 @@ struct AnalyticParams {
     fill_rule: u32,
     half_width: f32,
     cap_join_flags: u32,
-    _pad0: vec2<u32>,
+    scale_mode: u32,
+    _pad0: u32,
+    _pad1: u32,
 };
 
 @group(2) @binding(0) var<storage, read> analytic_segments: array<AnalyticSegment>;
@@ -46,6 +48,9 @@ fn solve_quadratic(a: f32, b: f32, c: f32) -> vec2<f32> {
     return vec2<f32>((-b - s) / (2.0 * a), (-b + s) / (2.0 * a));
 }
 
+const ROOT_EPS: f32 = 1e-5;
+const TANGENT_EPS: f32 = 1e-5;
+
 fn winding_contribution(seg: AnalyticSegment, p: vec2<f32>) -> i32 {
     let y0 = seg.start.y - p.y;
     let y1 = seg.control.y - p.y;
@@ -56,20 +61,47 @@ fn winding_contribution(seg: AnalyticSegment, p: vec2<f32>) -> i32 {
     let c = y0;
 
     let roots = solve_quadratic(a, b, c);
+    var t0 = roots.x;
+    var t1 = roots.y;
+    if (t1 < t0) {
+        let tmp = t0;
+        t0 = t1;
+        t1 = tmp;
+    }
     var wind: i32 = 0;
 
     for (var ri: i32 = 0; ri < 2; ri = ri + 1) {
-        let t = select(roots.x, roots.y, ri == 1);
-        if t < 0.0 || t >= 1.0 || abs(t) > 1e20 {
+        var t = select(t0, t1, ri == 1);
+        if !(t == t) || abs(t) > 1e30 {
+            continue;
+        }
+
+        // Deduplicate near-equal roots (tangent/double-root cases).
+        if (ri == 1 && abs(t1 - t0) <= ROOT_EPS) {
+            continue;
+        }
+
+        if (t < -ROOT_EPS || t > 1.0 + ROOT_EPS) {
+            continue;
+        }
+        t = clamp(t, 0.0, 1.0);
+
+        // Half-open interval: include t=0, exclude t=1 to avoid endpoint double-counting.
+        if (t >= 1.0 - ROOT_EPS) {
             continue;
         }
 
         let q = segment_point(seg, t);
-        if q.x <= p.x {
+        if q.x <= p.x + ROOT_EPS {
             continue;
         }
 
         let dy = segment_d1(seg, t).y;
+        // Ignore tangential contacts with the scanline.
+        if abs(dy) <= TANGENT_EPS {
+            continue;
+        }
+
         if dy > 0.0 {
             wind = wind + 1;
         } else if dy < 0.0 {
@@ -113,12 +145,73 @@ fn min_dist2_to_segment(seg: AnalyticSegment, p: vec2<f32>) -> f32 {
     return best;
 }
 
-fn analytic_coverage(object_pos: vec2<f32>) -> f32 {
+/// Compute signed distance from point to the stroke with cap handling.
+/// Cap encoding in cap_join_flags: bits 0-1 = start cap, bits 2-3 = end cap.
+/// 0=Butt, 1=Round, 2=Square.
+fn stroke_signed_distance(pos: vec2<f32>, effective_hw: f32) -> f32 {
+    let start_cap = analytic_params.cap_join_flags & 3u;
+    let end_cap = (analytic_params.cap_join_flags >> 2u) & 3u;
+    let n = analytic_params.num_segments;
+
+    if n == 0u {
+        return 1e30;
+    }
+
+    var best = 1e30;
+    for (var i: u32 = 0u; i < n; i = i + 1u) {
+        best = min(best, min_dist2_to_segment(analytic_segments[i], pos));
+    }
+    var dist = sqrt(best);
+
+    // Start cap
+    let first_seg = analytic_segments[0u];
+    var start_tangent = segment_d1(first_seg, 0.0);
+    if dot(start_tangent, start_tangent) < 1e-10 {
+        start_tangent = first_seg.end - first_seg.start;
+    }
+    let d_along_start = -dot(pos - first_seg.start, normalize(start_tangent));
+
+    if start_cap == 0u {
+        if d_along_start > 0.0 {
+            dist = max(dist, d_along_start);
+        }
+    } else if start_cap == 2u {
+        let beyond = d_along_start - effective_hw;
+        if beyond > 0.0 {
+            dist = max(dist, beyond);
+        }
+    }
+
+    // End cap
+    let last_seg = analytic_segments[n - 1u];
+    var end_tangent = segment_d1(last_seg, 1.0);
+    if dot(end_tangent, end_tangent) < 1e-10 {
+        end_tangent = last_seg.end - last_seg.start;
+    }
+    let d_along_end = dot(pos - last_seg.end, normalize(end_tangent));
+
+    if end_cap == 0u {
+        if d_along_end > 0.0 {
+            dist = max(dist, d_along_end);
+        }
+    } else if end_cap == 2u {
+        let beyond = d_along_end - effective_hw;
+        if beyond > 0.0 {
+            dist = max(dist, beyond);
+        }
+    }
+
+    return dist - effective_hw;
+}
+
+fn analytic_coverage(object_pos: vec2<f32>, aa_object: f32) -> f32 {
+    let bounds_pad = select(0.0, aa_object, analytic_params.mode == 1u);
     // Quick reject against draw bounds for both fill/stroke modes.
     if object_pos.x < analytic_params.bounds.x
-        || object_pos.y < analytic_params.bounds.y
-        || object_pos.x > analytic_params.bounds.z
-        || object_pos.y > analytic_params.bounds.w {
+        - bounds_pad
+        || object_pos.y < analytic_params.bounds.y - bounds_pad
+        || object_pos.x > analytic_params.bounds.z + bounds_pad
+        || object_pos.y > analytic_params.bounds.w + bounds_pad {
         return 0.0;
     }
 
@@ -136,11 +229,9 @@ fn analytic_coverage(object_pos: vec2<f32>) -> f32 {
     }
 
     // Stroke mode.
-    var best = 1e30;
-    for (var i: u32 = 0u; i < analytic_params.num_segments; i = i + 1u) {
-        best = min(best, min_dist2_to_segment(analytic_segments[i], object_pos));
-    }
+    let min_half_width = 0.5 * aa_object;
+    let effective_half_width = max(analytic_params.half_width, min_half_width);
 
-    let w2 = analytic_params.half_width * analytic_params.half_width;
-    return select(0.0, 1.0, best <= w2);
+    let signed_distance = stroke_signed_distance(object_pos, effective_half_width);
+    return saturate(0.5 - signed_distance / max(aa_object, 1e-5));
 }

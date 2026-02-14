@@ -29,6 +29,7 @@
 //! The stroke width is applied as a perpendicular offset from each edge.
 
 use crate::{BezierTexVertex, BezierVertex, GradientUniforms, TextureTransforms};
+use lyon_geom::{CubicBezierSegment, Point};
 use ruffle_render::backend::{ShapeHandle, ShapeHandleImpl};
 use ruffle_render::bitmap::BitmapHandle;
 use ruffle_render::shape_utils::{
@@ -44,6 +45,7 @@ const GRADIENT_SIZE: usize = 256;
 
 /// Number of subdivisions when flattening a Bézier stroke to line segments.
 const STROKE_BEZIER_SUBDIVISIONS: usize = 16;
+const CUBIC_TO_QUADRATIC_TOLERANCE: f32 = 0.01;
 
 /// A complete mesh for one registered shape, ready to be drawn.
 #[derive(Debug)]
@@ -112,6 +114,8 @@ pub struct AnalyticStrokeData {
     pub start_cap: LineCapStyle,
     pub end_cap: LineCapStyle,
     pub join_style: LineJoinStyle,
+    /// Stroke `LineScaleMode`: 0=None, 1=Horizontal, 2=Vertical, 3=Both.
+    pub scale_mode: u32,
 }
 
 /// What kind of fill this draw uses.
@@ -226,7 +230,7 @@ fn build_fill_draw(
         FillStyle::Bitmap { .. } => (FillKind::Bitmap, false),
     };
 
-    let maybe_analytic = if let Some(analytic_layout) = analytic_layout {
+    let maybe_analytic = analytic_layout.and_then(|analytic_layout| {
         let analytic_fill = build_analytic_fill_data(device, commands)?;
         let analytic_bind_group = create_analytic_bind_group(
             device,
@@ -237,11 +241,18 @@ fn build_fill_draw(
             0,
             winding_rule,
             0.0,
+            3, // scale_mode = Both (unused for fills)
+            0, // cap_join_flags unused for fills
         );
         Some((analytic_fill, analytic_bind_group))
-    } else {
-        None
-    };
+    });
+
+    if maybe_analytic.is_none() && !fill_is_fan_safe(commands) {
+        tracing::warn!(
+            "Skipping non-analytic complex fill: fan fallback is not winding-correct for holes/concavity"
+        );
+        return None;
+    }
 
     if use_color_vertices {
         let color = match style {
@@ -435,6 +446,58 @@ fn build_fill_draw(
     }
 }
 
+fn fill_is_fan_safe(commands: &[DrawCommand]) -> bool {
+    let mut move_count = 0usize;
+    let mut pts: Vec<[f32; 2]> = Vec::new();
+
+    for cmd in commands {
+        match cmd {
+            DrawCommand::MoveTo(pt) => {
+                move_count += 1;
+                pts.push([pt.x.to_pixels() as f32, pt.y.to_pixels() as f32]);
+            }
+            DrawCommand::LineTo(pt) => {
+                pts.push([pt.x.to_pixels() as f32, pt.y.to_pixels() as f32]);
+            }
+            DrawCommand::QuadraticCurveTo { anchor, .. } => {
+                pts.push([anchor.x.to_pixels() as f32, anchor.y.to_pixels() as f32]);
+            }
+            DrawCommand::CubicCurveTo { .. } => {
+                // Cubics can induce high curvature and concavity; do not treat as fan-safe.
+                return false;
+            }
+        }
+    }
+
+    if move_count != 1 || pts.len() < 3 {
+        return false;
+    }
+
+    // Convexity test on on-curve points.
+    let mut sign: f32 = 0.0;
+    let n = pts.len();
+    for i in 0..n {
+        let p0 = pts[i];
+        let p1 = pts[(i + 1) % n];
+        let p2 = pts[(i + 2) % n];
+        let x1 = p1[0] - p0[0];
+        let y1 = p1[1] - p0[1];
+        let x2 = p2[0] - p1[0];
+        let y2 = p2[1] - p1[1];
+        let cross = x1 * y2 - y1 * x2;
+        if cross.abs() <= 1e-6 {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if cross.signum() != sign {
+            return false;
+        }
+    }
+
+    true
+}
+
 /// Classification of fill type for dispatch.
 enum FillKind {
     Color,
@@ -483,12 +546,12 @@ fn build_fill_geometry_color(
                 });
 
                 // Fan triangle: fan_origin → prev → current.
-                if let (Some(origin), Some(prev)) = (fan_origin, prev_index) {
-                    if origin != prev && prev != idx {
-                        indices.push(origin);
-                        indices.push(prev);
-                        indices.push(idx);
-                    }
+                if let (Some(origin), Some(prev)) = (fan_origin, prev_index)
+                    && origin != prev && prev != idx
+                {
+                    indices.push(origin);
+                    indices.push(prev);
+                    indices.push(idx);
                 }
                 prev_index = Some(idx);
             }
@@ -508,12 +571,12 @@ fn build_fill_geometry_color(
                 });
 
                 // Fan triangle from origin → prev on-curve point → anchor.
-                if let (Some(origin), Some(prev)) = (fan_origin, prev_index) {
-                    if origin != prev && prev != anchor_idx {
-                        indices.push(origin);
-                        indices.push(prev);
-                        indices.push(anchor_idx);
-                    }
+                if let (Some(origin), Some(prev)) = (fan_origin, prev_index)
+                    && origin != prev && prev != anchor_idx
+                {
+                    indices.push(origin);
+                    indices.push(prev);
+                    indices.push(anchor_idx);
                 }
 
                 // Now create the Loop-Blinn curve correction triangle.
@@ -609,12 +672,12 @@ fn build_fill_geometry_color(
                         _pad: 0,
                     });
 
-                    if let (Some(origin), Some(prev)) = (fan_origin, prev_index) {
-                        if origin != prev && prev != idx {
-                            indices.push(origin);
-                            indices.push(prev);
-                            indices.push(idx);
-                        }
+                    if let (Some(origin), Some(prev)) = (fan_origin, prev_index)
+                        && origin != prev && prev != idx
+                    {
+                        indices.push(origin);
+                        indices.push(prev);
+                        indices.push(idx);
                     }
                     prev_index = Some(idx);
                 }
@@ -658,12 +721,12 @@ fn build_fill_geometry_tex(
                     _pad: 0,
                 });
 
-                if let (Some(origin), Some(prev)) = (fan_origin, prev_index) {
-                    if origin != prev && prev != idx {
-                        indices.push(origin);
-                        indices.push(prev);
-                        indices.push(idx);
-                    }
+                if let (Some(origin), Some(prev)) = (fan_origin, prev_index)
+                    && origin != prev && prev != idx
+                {
+                    indices.push(origin);
+                    indices.push(prev);
+                    indices.push(idx);
                 }
                 prev_index = Some(idx);
             }
@@ -679,12 +742,12 @@ fn build_fill_geometry_tex(
                     _pad: 0,
                 });
 
-                if let (Some(origin), Some(prev)) = (fan_origin, prev_index) {
-                    if origin != prev && prev != anchor_idx {
-                        indices.push(origin);
-                        indices.push(prev);
-                        indices.push(anchor_idx);
-                    }
+                if let (Some(origin), Some(prev)) = (fan_origin, prev_index)
+                    && origin != prev && prev != anchor_idx
+                {
+                    indices.push(origin);
+                    indices.push(prev);
+                    indices.push(anchor_idx);
                 }
 
                 // Loop-Blinn curve correction triangle.
@@ -769,12 +832,12 @@ fn build_fill_geometry_tex(
                         _pad: 0,
                     });
 
-                    if let (Some(origin), Some(prev_i)) = (fan_origin, prev_index) {
-                        if origin != prev_i && prev_i != idx {
-                            indices.push(origin);
-                            indices.push(prev_i);
-                            indices.push(idx);
-                        }
+                    if let (Some(origin), Some(prev_i)) = (fan_origin, prev_index)
+                        && origin != prev_i && prev_i != idx
+                    {
+                        indices.push(origin);
+                        indices.push(prev_i);
+                        indices.push(idx);
                     }
                     prev_index = Some(idx);
                 }
@@ -805,20 +868,28 @@ fn build_stroke_draw(
     default_sampler: &wgpu::Sampler,
 ) -> Option<Draw> {
     let width = style.width();
-    // Flash draws hairline strokes at 1px minimum.
-    let half_width = (width.to_pixels() as f32 / 2.0).max(0.5);
+    // Keep authored stroke width in object space. Hairline minimum handling is
+    // applied in the analytic shader in screen space.
+    let half_width = width.to_pixels() as f32 / 2.0;
 
     let fill_style = style.fill_style();
     let start_cap = style.start_cap();
     let end_cap = style.end_cap();
     let join_style = style.join_style();
 
-    // The current analytic stroke shader models stroke coverage as distance to
-    // the curve set, which naturally matches round caps/joins. For other cap/join
-    // styles, keep classic mesh expansion for better parity.
-    let supports_analytic_stroke_style = matches!(start_cap, LineCapStyle::Round)
-        && matches!(end_cap, LineCapStyle::Round)
-        && matches!(join_style, LineJoinStyle::Round);
+    // Derive LineScaleMode from the SWF allow_scale_x/y flags.
+    // 0 = None, 1 = Horizontal, 2 = Vertical, 3 = Both (default).
+    let scale_mode: u32 = match (style.allow_scale_x(), style.allow_scale_y()) {
+        (false, false) => 0,
+        (true, false) => 1,
+        (false, true) => 2,
+        (true, true) => 3,
+    };
+
+    // The analytic stroke shader supports all cap styles (butt/round/square)
+    // via cap_join_flags. For now, join styles other than Round still fall back
+    // to classic mesh expansion.
+    let supports_analytic_stroke_style = matches!(join_style, LineJoinStyle::Round);
 
     let maybe_analytic = if let Some(analytic_layout) = analytic_layout
         && supports_analytic_stroke_style
@@ -831,6 +902,7 @@ fn build_stroke_draw(
             start_cap,
             end_cap,
             join_style,
+            scale_mode,
         )?;
 
         let analytic_bind_group = create_analytic_bind_group(
@@ -842,6 +914,8 @@ fn build_stroke_draw(
             1,
             FillRule::EvenOdd,
             half_width,
+            scale_mode,
+            pack_cap_join_flags(start_cap, end_cap),
         );
         Some((analytic_stroke, analytic_bind_group))
     } else {
@@ -1073,6 +1147,22 @@ fn build_analytic_quad_tex(bounds: [f32; 4]) -> (Vec<BezierTexVertex>, Vec<u32>)
     (vertices, indices)
 }
 
+/// Encode a `LineCapStyle` into a 2-bit integer for GPU upload.
+/// 0 = Butt (None), 1 = Round, 2 = Square.
+fn cap_style_to_bits(cap: LineCapStyle) -> u32 {
+    match cap {
+        LineCapStyle::None => 0,
+        LineCapStyle::Round => 1,
+        LineCapStyle::Square => 2,
+    }
+}
+
+/// Pack start and end cap styles into a single `u32`.
+/// Bits 0-1: start cap, bits 2-3: end cap.
+fn pack_cap_join_flags(start_cap: LineCapStyle, end_cap: LineCapStyle) -> u32 {
+    cap_style_to_bits(start_cap) | (cap_style_to_bits(end_cap) << 2)
+}
+
 fn create_analytic_bind_group(
     device: &wgpu::Device,
     analytic_layout: &wgpu::BindGroupLayout,
@@ -1082,6 +1172,8 @@ fn create_analytic_bind_group(
     mode: u32,
     fill_rule: FillRule,
     half_width: f32,
+    scale_mode: u32,
+    cap_join_flags: u32,
 ) -> wgpu::BindGroup {
     let params = crate::AnalyticParams {
         bounds,
@@ -1092,8 +1184,9 @@ fn create_analytic_bind_group(
             FillRule::NonZero => 1,
         },
         half_width,
-        cap_join_flags: 0,
-        _pad0: [0, 0, 0],
+        cap_join_flags,
+        scale_mode,
+        _pad0: [0, 0],
     };
     let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Analytic params"),
@@ -1129,17 +1222,27 @@ fn build_analytic_stroke_data(
     start_cap: LineCapStyle,
     end_cap: LineCapStyle,
     join_style: LineJoinStyle,
+    scale_mode: u32,
 ) -> Option<AnalyticStrokeData> {
-    let (segments, bounds) = collect_quadratic_segments(commands);
+    let (segments, bounds) = collect_quadratic_segments(commands, is_closed, is_closed);
     if segments.is_empty() {
         return None;
     }
 
+    // Square caps extend by half_width beyond the endpoint, so widen bounds
+    // by 2*half_width when either cap is square. Round/butt only need half_width.
+    let cap_extra = if !is_closed
+        && (matches!(start_cap, LineCapStyle::Square) || matches!(end_cap, LineCapStyle::Square))
+    {
+        half_width * 2.0
+    } else {
+        half_width
+    };
     let expanded_bounds = [
-        bounds[0] - half_width,
-        bounds[1] - half_width,
-        bounds[2] + half_width,
-        bounds[3] + half_width,
+        bounds[0] - cap_extra,
+        bounds[1] - cap_extra,
+        bounds[2] + cap_extra,
+        bounds[3] + cap_extra,
     ];
 
     let segment_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1157,6 +1260,7 @@ fn build_analytic_stroke_data(
         start_cap,
         end_cap,
         join_style,
+        scale_mode,
     })
 }
 
@@ -1165,7 +1269,10 @@ fn build_analytic_fill_data(
     device: &wgpu::Device,
     commands: &[DrawCommand],
 ) -> Option<AnalyticFillData> {
-    let (segments, bounds) = collect_quadratic_segments(commands);
+    // Fill paths require all contours to be closed for correct winding
+    // evaluation. Close each subpath when a new MoveTo appears, and
+    // close the final subpath as well.
+    let (segments, bounds) = collect_quadratic_segments(commands, true, true);
     if segments.is_empty() {
         return None;
     }
@@ -1184,7 +1291,15 @@ fn build_analytic_fill_data(
 }
 
 /// Convert draw commands into a list of oriented quadratic segments and bounds.
-fn collect_quadratic_segments(commands: &[DrawCommand]) -> (Vec<GpuQuadraticSegment>, [f32; 4]) {
+///
+/// When `close_subpaths` is true, each subpath is implicitly closed.
+fn collect_quadratic_segments(
+    commands: &[DrawCommand],
+    close_on_move_to: bool,
+    close_final_subpath: bool,
+) -> (Vec<GpuQuadraticSegment>, [f32; 4]) {
+    const CLOSE_EPS2: f32 = 1e-6;
+
     let mut segments = Vec::new();
 
     let mut min_x = f32::INFINITY;
@@ -1212,17 +1327,23 @@ fn collect_quadratic_segments(commands: &[DrawCommand]) -> (Vec<GpuQuadraticSegm
         });
     };
 
+    let points_differ = |a: [f32; 2], b: [f32; 2]| {
+        let dx = a[0] - b[0];
+        let dy = a[1] - b[1];
+        dx * dx + dy * dy > CLOSE_EPS2
+    };
+
     for cmd in commands {
         match cmd {
             DrawCommand::MoveTo(pt) => {
                 let p = [pt.x.to_pixels() as f32, pt.y.to_pixels() as f32];
 
                 // Close previous subpath if needed.
-                if let (Some(start), Some(cur)) = (subpath_start, cursor) {
-                    if start != cur {
-                        push_line_as_quad(cur, start, &mut segments);
-                        include(start);
-                    }
+                if close_on_move_to && let (Some(start), Some(cur)) = (subpath_start, cursor)
+                    && points_differ(start, cur)
+                {
+                    push_line_as_quad(cur, start, &mut segments);
+                    include(start);
                 }
 
                 cursor = Some(p);
@@ -1259,52 +1380,54 @@ fn collect_quadratic_segments(commands: &[DrawCommand]) -> (Vec<GpuQuadraticSegm
                 control_b,
                 anchor,
             } => {
-                // Phase 1 fallback: flatten cubic to line-as-quadratic segments.
+                // Convert cubic to quadratic segments for robust winding evaluation.
                 let Some(from) = cursor else { continue };
 
-                let steps = 16;
-                let mut prev = from;
-                for i in 1..=steps {
-                    let t = i as f32 / steps as f32;
-                    let mt = 1.0 - t;
-                    let mt2 = mt * mt;
-                    let mt3 = mt2 * mt;
-                    let t2 = t * t;
-                    let t3 = t2 * t;
+                let c1 = [control_a.x.to_pixels() as f32, control_a.y.to_pixels() as f32];
+                let c2 = [control_b.x.to_pixels() as f32, control_b.y.to_pixels() as f32];
+                let to = [anchor.x.to_pixels() as f32, anchor.y.to_pixels() as f32];
 
-                    let p = [
-                        mt3 * from[0]
-                            + 3.0 * mt2 * t * control_a.x.to_pixels() as f32
-                            + 3.0 * mt * t2 * control_b.x.to_pixels() as f32
-                            + t3 * anchor.x.to_pixels() as f32,
-                        mt3 * from[1]
-                            + 3.0 * mt2 * t * control_a.y.to_pixels() as f32
-                            + 3.0 * mt * t2 * control_b.y.to_pixels() as f32
-                            + t3 * anchor.y.to_pixels() as f32,
-                    ];
-
-                    push_line_as_quad(prev, p, &mut segments);
-                    include(prev);
-                    include(p);
-                    prev = p;
+                CubicBezierSegment {
+                    from: Point::new(from[0], from[1]),
+                    ctrl1: Point::new(c1[0], c1[1]),
+                    ctrl2: Point::new(c2[0], c2[1]),
+                    to: Point::new(to[0], to[1]),
                 }
-                cursor = Some(prev);
+                .for_each_quadratic_bezier(
+                    CUBIC_TO_QUADRATIC_TOLERANCE,
+                    &mut |quadratic_curve| {
+                        let q_from = [quadratic_curve.from.x, quadratic_curve.from.y];
+                        let q_ctrl = [quadratic_curve.ctrl.x, quadratic_curve.ctrl.y];
+                        let q_to = [quadratic_curve.to.x, quadratic_curve.to.y];
+                        segments.push(GpuQuadraticSegment {
+                            start: q_from,
+                            control: q_ctrl,
+                            end: q_to,
+                            _pad0: [0.0, 0.0],
+                        });
+                        include(q_from);
+                        include(q_ctrl);
+                        include(q_to);
+                    },
+                );
+
+                cursor = Some(to);
             }
         }
     }
 
     // Close final subpath if needed.
-    if let (Some(start), Some(cur)) = (subpath_start, cursor) {
-        if start != cur {
-            let control = [(cur[0] + start[0]) * 0.5, (cur[1] + start[1]) * 0.5];
-            segments.push(GpuQuadraticSegment {
-                start: cur,
-                control,
-                end: start,
-                _pad0: [0.0, 0.0],
-            });
-            include(start);
-        }
+    if close_final_subpath && let (Some(start), Some(cur)) = (subpath_start, cursor)
+        && points_differ(start, cur)
+    {
+        let control = [(cur[0] + start[0]) * 0.5, (cur[1] + start[1]) * 0.5];
+        segments.push(GpuQuadraticSegment {
+            start: cur,
+            control,
+            end: start,
+            _pad0: [0.0, 0.0],
+        });
+        include(start);
     }
 
     let bounds = if min_x.is_finite() {
@@ -1314,6 +1437,46 @@ fn collect_quadratic_segments(commands: &[DrawCommand]) -> (Vec<GpuQuadraticSegm
     };
 
     (segments, bounds)
+}
+
+fn point_line_distance(point: [f32; 2], line_a: [f32; 2], line_b: [f32; 2]) -> f32 {
+    let vx = line_b[0] - line_a[0];
+    let vy = line_b[1] - line_a[1];
+    let len2 = vx * vx + vy * vy;
+    if len2 <= 1e-12 {
+        let dx = point[0] - line_a[0];
+        let dy = point[1] - line_a[1];
+        return (dx * dx + dy * dy).sqrt();
+    }
+
+    let wx = point[0] - line_a[0];
+    let wy = point[1] - line_a[1];
+    let area2 = (vx * wy - vy * wx).abs();
+    area2 / len2.sqrt()
+}
+
+fn adaptive_cubic_subdivisions(
+    p0: [f32; 2],
+    c1: [f32; 2],
+    c2: [f32; 2],
+    p3: [f32; 2],
+) -> usize {
+    const MIN_STEPS: usize = 8;
+    const MAX_STEPS: usize = 64;
+
+    let chord_dx = p3[0] - p0[0];
+    let chord_dy = p3[1] - p0[1];
+    let chord = (chord_dx * chord_dx + chord_dy * chord_dy).sqrt().max(1.0);
+
+    let d1 = point_line_distance(c1, p0, p3);
+    let d2 = point_line_distance(c2, p0, p3);
+    let flatness = d1.max(d2);
+
+    let length_factor = (chord / 24.0).ceil();
+    let flatness_factor = 1.0 + flatness / 4.0;
+    let steps = (length_factor * flatness_factor).ceil() as usize;
+
+    steps.clamp(MIN_STEPS, MAX_STEPS)
 }
 
 /// Flatten DrawCommands into polyline sub-paths.
@@ -1335,7 +1498,9 @@ fn flatten_commands_to_polylines(commands: &[DrawCommand]) -> Vec<Vec<[f32; 2]>>
                 points.push([pt.x.to_pixels() as f32, pt.y.to_pixels() as f32]);
             }
             DrawCommand::QuadraticCurveTo { control, anchor } => {
-                let start = *points.last().unwrap_or(&[0.0, 0.0]);
+                let Some(start) = points.last().copied() else {
+                    continue;
+                };
                 for i in 1..=STROKE_BEZIER_SUBDIVISIONS {
                     let t = i as f32 / STROKE_BEZIER_SUBDIVISIONS as f32;
                     let mt = 1.0 - t;
@@ -1349,22 +1514,22 @@ fn flatten_commands_to_polylines(commands: &[DrawCommand]) -> Vec<Vec<[f32; 2]>>
                 }
             }
             DrawCommand::CubicCurveTo { control_a, control_b, anchor } => {
-                let start = *points.last().unwrap_or(&[0.0, 0.0]);
-                for i in 1..=STROKE_BEZIER_SUBDIVISIONS {
-                    let t = i as f32 / STROKE_BEZIER_SUBDIVISIONS as f32;
+                let Some(start) = points.last().copied() else {
+                    continue;
+                };
+                let c1 = [control_a.x.to_pixels() as f32, control_a.y.to_pixels() as f32];
+                let c2 = [control_b.x.to_pixels() as f32, control_b.y.to_pixels() as f32];
+                let to = [anchor.x.to_pixels() as f32, anchor.y.to_pixels() as f32];
+                let steps = adaptive_cubic_subdivisions(start, c1, c2, to);
+                for i in 1..=steps {
+                    let t = i as f32 / steps as f32;
                     let mt = 1.0 - t;
                     let mt2 = mt * mt;
                     let mt3 = mt2 * mt;
                     let t2 = t * t;
                     let t3 = t2 * t;
-                    let x = mt3 * start[0]
-                        + 3.0 * mt2 * t * control_a.x.to_pixels() as f32
-                        + 3.0 * mt * t2 * control_b.x.to_pixels() as f32
-                        + t3 * anchor.x.to_pixels() as f32;
-                    let y = mt3 * start[1]
-                        + 3.0 * mt2 * t * control_a.y.to_pixels() as f32
-                        + 3.0 * mt * t2 * control_b.y.to_pixels() as f32
-                        + t3 * anchor.y.to_pixels() as f32;
+                    let x = mt3 * start[0] + 3.0 * mt2 * t * c1[0] + 3.0 * mt * t2 * c2[0] + t3 * to[0];
+                    let y = mt3 * start[1] + 3.0 * mt2 * t * c1[1] + 3.0 * mt * t2 * c2[1] + t3 * to[1];
                     points.push([x, y]);
                 }
             }
@@ -1435,10 +1600,16 @@ fn add_cap_color(
                 position: point,
                 uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
             });
-            // Compute the start angle from the normal.
+            // Compute arc direction from stroke direction so the cap faces outward.
             let start_angle = normal[1].atan2(normal[0]);
+            let cross = direction[0] * normal[1] - direction[1] * normal[0];
+            let sweep = if cross < 0.0 {
+                std::f32::consts::PI
+            } else {
+                -std::f32::consts::PI
+            };
             for i in 0..=ROUND_CAP_SEGMENTS {
-                let angle = start_angle + std::f32::consts::PI * (i as f32 / ROUND_CAP_SEGMENTS as f32);
+                let angle = start_angle + sweep * (i as f32 / ROUND_CAP_SEGMENTS as f32);
                 let vx = point[0] + angle.cos() * half_width;
                 let vy = point[1] + angle.sin() * half_width;
                 let idx = vertices.len() as u32;
@@ -1542,8 +1713,8 @@ fn add_join_color(
             let mut sweep = angle1 - angle0;
             if cross > 0.0 {
                 if sweep < 0.0 { sweep += 2.0 * std::f32::consts::PI; }
-            } else {
-                if sweep > 0.0 { sweep -= 2.0 * std::f32::consts::PI; }
+            } else if sweep > 0.0 {
+                sweep -= 2.0 * std::f32::consts::PI;
             }
 
             let steps = ((sweep.abs() / std::f32::consts::PI * ROUND_CAP_SEGMENTS as f32).ceil() as usize).max(2);
@@ -1621,6 +1792,18 @@ fn expand_stroke_path_color(
     if points.len() < 2 {
         return;
     }
+
+    let mut path_points: Vec<[f32; 2]> = points.to_vec();
+    if is_closed {
+        let first = path_points[0];
+        let last = *path_points.last().unwrap();
+        let dx = first[0] - last[0];
+        let dy = first[1] - last[1];
+        if dx * dx + dy * dy > 1e-6 {
+            path_points.push(first);
+        }
+    }
+    let points = path_points.as_slice();
 
     // Collect segment normals.
     let mut normals: Vec<[f32; 2]> = Vec::new();
@@ -1748,8 +1931,14 @@ fn add_cap_tex(
                 uv: [0.0, 0.0], fill_type: 0, _pad: 0,
             });
             let start_angle = normal[1].atan2(normal[0]);
+            let cross = direction[0] * normal[1] - direction[1] * normal[0];
+            let sweep = if cross < 0.0 {
+                std::f32::consts::PI
+            } else {
+                -std::f32::consts::PI
+            };
             for i in 0..=ROUND_CAP_SEGMENTS {
-                let angle = start_angle + std::f32::consts::PI * (i as f32 / ROUND_CAP_SEGMENTS as f32);
+                let angle = start_angle + sweep * (i as f32 / ROUND_CAP_SEGMENTS as f32);
                 let vx = point[0] + angle.cos() * half_width;
                 let vy = point[1] + angle.sin() * half_width;
                 let idx = vertices.len() as u32;
@@ -1819,8 +2008,8 @@ fn add_join_tex(
             let mut sweep = angle1 - angle0;
             if cross > 0.0 {
                 if sweep < 0.0 { sweep += 2.0 * std::f32::consts::PI; }
-            } else {
-                if sweep > 0.0 { sweep -= 2.0 * std::f32::consts::PI; }
+            } else if sweep > 0.0 {
+                sweep -= 2.0 * std::f32::consts::PI;
             }
             let steps = ((sweep.abs() / std::f32::consts::PI * ROUND_CAP_SEGMENTS as f32).ceil() as usize).max(2);
             let center_idx = vertices.len() as u32;
@@ -1874,6 +2063,18 @@ fn expand_stroke_path_tex(
     if points.len() < 2 {
         return;
     }
+
+    let mut path_points: Vec<[f32; 2]> = points.to_vec();
+    if is_closed {
+        let first = path_points[0];
+        let last = *path_points.last().unwrap();
+        let dx = first[0] - last[0];
+        let dy = first[1] - last[1];
+        if dx * dx + dy * dy > 1e-6 {
+            path_points.push(first);
+        }
+    }
+    let points = path_points.as_slice();
 
     let mut normals: Vec<[f32; 2]> = Vec::new();
     let mut directions: Vec<[f32; 2]> = Vec::new();
@@ -2126,6 +2327,10 @@ fn swf_bitmap_to_gl_matrix(
 ) -> [[f32; 3]; 3] {
     let bitmap_width = bitmap_width as f32;
     let bitmap_height = bitmap_height as f32;
+
+    if bitmap_width <= 0.0 || bitmap_height <= 0.0 {
+        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    }
 
     let tx = m.tx.get() as f32;
     let ty = m.ty.get() as f32;

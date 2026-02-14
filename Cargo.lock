@@ -4756,6 +4756,7 @@ dependencies = [
  "enum-map",
  "futures",
  "indexmap",
+ "lyon_geom",
  "ruffle_render",
  "swf",
  "tracing",

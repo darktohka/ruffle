@@ -34,7 +34,7 @@ use ruffle_render::bitmap::BitmapHandle;
 use ruffle_render::shape_utils::{DistilledShape, DrawCommand, DrawPath, GradientType};
 use std::any::Any;
 use std::collections::HashMap;
-use swf::{FillStyle, GradientRecord, Twips};
+use swf::{FillStyle, GradientRecord, LineCapStyle, LineJoinStyle, LineStyle, Twips};
 use wgpu::util::DeviceExt;
 
 /// How big to make gradient lookup textures.
@@ -121,10 +121,15 @@ pub fn build_mesh(
             } => {
                 let draw = build_stroke_draw(
                     device,
+                    queue,
                     commands,
-                    style.fill_style(),
-                    style.width(),
+                    style,
                     *is_closed,
+                    shape.id,
+                    bitmap_handles,
+                    gradient_layout,
+                    bitmap_layout,
+                    default_sampler,
                 );
                 if let Some(draw) = draw {
                     draws.push(draw);
@@ -685,40 +690,216 @@ fn build_fill_geometry_tex(
 
 /// Build geometry for a stroke path.
 ///
+/// Supports solid color, gradient, and bitmap stroke fills.
 /// Each line segment is expanded into a quad (2 triangles) using the stroke width.
 /// Bézier segments are subdivided into line segments first.
+/// Proper line caps (butt/round/square) and joins (miter/round/bevel) are applied.
 fn build_stroke_draw(
     device: &wgpu::Device,
+    queue: &wgpu::Queue,
     commands: &[DrawCommand],
-    fill_style: &FillStyle,
-    width: Twips,
-    _is_closed: bool,
+    style: &LineStyle,
+    is_closed: bool,
+    _shape_id: swf::CharacterId,
+    bitmap_handles: &HashMap<u16, BitmapHandle>,
+    gradient_layout: &wgpu::BindGroupLayout,
+    bitmap_layout: &wgpu::BindGroupLayout,
+    default_sampler: &wgpu::Sampler,
 ) -> Option<Draw> {
+    let width = style.width();
     let half_width = width.to_pixels() as f32 / 2.0;
-    if half_width <= 0.0 {
+    // Flash draws hairline strokes at 1px minimum.
+    let half_width = if half_width <= 0.0 { 0.5 } else { half_width };
+
+    let fill_style = style.fill_style();
+    let start_cap = style.start_cap();
+    let end_cap = style.end_cap();
+    let join_style = style.join_style();
+
+    // Flatten all commands into sub-path polylines.
+    let sub_paths = flatten_commands_to_polylines(commands);
+    if sub_paths.is_empty() {
         return None;
     }
 
-    let color = match fill_style {
-        FillStyle::Color(c) => [
-            f32::from(c.r) / 255.0,
-            f32::from(c.g) / 255.0,
-            f32::from(c.b) / 255.0,
-            f32::from(c.a) / 255.0,
-        ],
-        // For non-color strokes, default to white and let the color transform handle it.
-        _ => [1.0, 1.0, 1.0, 1.0],
-    };
+    let use_color_vertices = matches!(fill_style, FillStyle::Color(_));
 
-    // Flatten all commands into a polyline.
-    let mut points: Vec<[f32; 2]> = Vec::new();
+    if use_color_vertices {
+        let color = match fill_style {
+            FillStyle::Color(c) => [
+                f32::from(c.r) / 255.0,
+                f32::from(c.g) / 255.0,
+                f32::from(c.b) / 255.0,
+                f32::from(c.a) / 255.0,
+            ],
+            _ => unreachable!(),
+        };
+
+        let mut vertices: Vec<BezierVertex> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+
+        for path in &sub_paths {
+            expand_stroke_path_color(
+                path, half_width, color, is_closed,
+                start_cap, end_cap, join_style,
+                &mut vertices, &mut indices,
+            );
+        }
+
+        if indices.is_empty() {
+            return None;
+        }
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Stroke color vertices"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Stroke color indices"),
+            contents: bytemuck::cast_slice(&indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        Some(Draw {
+            draw_type: DrawType::Color,
+            vertex_buffer,
+            index_buffer,
+            num_indices: indices.len() as u32,
+        })
+    } else {
+        // Gradient or bitmap stroke: use BezierTexVertex.
+        let mut vertices: Vec<BezierTexVertex> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+
+        for path in &sub_paths {
+            expand_stroke_path_tex(
+                path, half_width, is_closed,
+                start_cap, end_cap, join_style,
+                &mut vertices, &mut indices,
+            );
+        }
+
+        if indices.is_empty() {
+            return None;
+        }
+
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Stroke tex vertices"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Stroke tex indices"),
+            contents: bytemuck::cast_slice(&indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        let draw_type = match fill_style {
+            FillStyle::LinearGradient(gradient) => {
+                let bind_group = create_gradient_bind_group(
+                    device, queue, gradient_layout, default_sampler,
+                    GradientType::Linear, gradient, swf::Fixed8::ZERO,
+                );
+                DrawType::Gradient { bind_group }
+            }
+            FillStyle::RadialGradient(gradient) => {
+                let bind_group = create_gradient_bind_group(
+                    device, queue, gradient_layout, default_sampler,
+                    GradientType::Radial, gradient, swf::Fixed8::ZERO,
+                );
+                DrawType::Gradient { bind_group }
+            }
+            FillStyle::FocalGradient { gradient, focal_point } => {
+                let bind_group = create_gradient_bind_group(
+                    device, queue, gradient_layout, default_sampler,
+                    GradientType::Focal, gradient, *focal_point,
+                );
+                DrawType::Gradient { bind_group }
+            }
+            FillStyle::Bitmap { id, matrix, is_smoothed, is_repeating } => {
+                if let Some(handle) = bitmap_handles.get(id) {
+                    let texture: &crate::Texture =
+                        <dyn Any>::downcast_ref(&*handle.0).expect("Must be a Texture");
+                    let texture_view = texture.texture.create_view(&Default::default());
+
+                    let tex_matrix = swf_to_gl_matrix((*matrix).into());
+                    let tex_transforms_data = TextureTransforms {
+                        u_matrix: matrix_3x3_to_4x4(&tex_matrix),
+                    };
+                    let tex_transforms_buffer =
+                        device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                            label: Some("Stroke bitmap tex transforms"),
+                            contents: bytemuck::bytes_of(&tex_transforms_data),
+                            usage: wgpu::BufferUsages::UNIFORM,
+                        });
+
+                    let address_mode = if *is_repeating {
+                        wgpu::AddressMode::Repeat
+                    } else {
+                        wgpu::AddressMode::ClampToEdge
+                    };
+                    let filter_mode = if *is_smoothed {
+                        wgpu::FilterMode::Linear
+                    } else {
+                        wgpu::FilterMode::Nearest
+                    };
+                    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+                        label: Some("Stroke bitmap sampler"),
+                        address_mode_u: address_mode,
+                        address_mode_v: address_mode,
+                        mag_filter: filter_mode,
+                        min_filter: filter_mode,
+                        ..Default::default()
+                    });
+
+                    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("Stroke bitmap bind group"),
+                        layout: bitmap_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: tex_transforms_buffer.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(&texture_view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::Sampler(&sampler),
+                            },
+                        ],
+                    });
+                    DrawType::Bitmap { bind_group }
+                } else {
+                    return None;
+                }
+            }
+            _ => unreachable!(),
+        };
+
+        Some(Draw {
+            draw_type,
+            vertex_buffer,
+            index_buffer,
+            num_indices: indices.len() as u32,
+        })
+    }
+}
+
+/// Flatten DrawCommands into polyline sub-paths.
+fn flatten_commands_to_polylines(commands: &[DrawCommand]) -> Vec<Vec<[f32; 2]>> {
     let mut sub_paths: Vec<Vec<[f32; 2]>> = Vec::new();
+    let mut points: Vec<[f32; 2]> = Vec::new();
 
     for cmd in commands {
         match cmd {
             DrawCommand::MoveTo(pt) => {
                 if points.len() >= 2 {
                     sub_paths.push(std::mem::take(&mut points));
+                } else {
+                    points.clear();
                 }
                 points.push([pt.x.to_pixels() as f32, pt.y.to_pixels() as f32]);
             }
@@ -726,7 +907,6 @@ fn build_stroke_draw(
                 points.push([pt.x.to_pixels() as f32, pt.y.to_pixels() as f32]);
             }
             DrawCommand::QuadraticCurveTo { control, anchor } => {
-                // Subdivide quadratic Bézier into line segments.
                 let start = *points.last().unwrap_or(&[0.0, 0.0]);
                 for i in 1..=STROKE_BEZIER_SUBDIVISIONS {
                     let t = i as f32 / STROKE_BEZIER_SUBDIVISIONS as f32;
@@ -740,11 +920,7 @@ fn build_stroke_draw(
                     points.push([x, y]);
                 }
             }
-            DrawCommand::CubicCurveTo {
-                control_a,
-                control_b,
-                anchor,
-            } => {
+            DrawCommand::CubicCurveTo { control_a, control_b, anchor } => {
                 let start = *points.last().unwrap_or(&[0.0, 0.0]);
                 for i in 1..=STROKE_BEZIER_SUBDIVISIONS {
                     let t = i as f32 / STROKE_BEZIER_SUBDIVISIONS as f32;
@@ -769,43 +945,248 @@ fn build_stroke_draw(
     if points.len() >= 2 {
         sub_paths.push(points);
     }
-
-    // Expand each sub-path into stroke quads.
-    let mut vertices: Vec<BezierVertex> = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
-
-    for path in &sub_paths {
-        expand_stroke_path(path, half_width, color, &mut vertices, &mut indices);
-    }
-
-    if indices.is_empty() {
-        return None;
-    }
-
-    let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Stroke vertices"),
-        contents: bytemuck::cast_slice(&vertices),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
-    let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("Stroke indices"),
-        contents: bytemuck::cast_slice(&indices),
-        usage: wgpu::BufferUsages::INDEX,
-    });
-
-    Some(Draw {
-        draw_type: DrawType::Color,
-        vertex_buffer,
-        index_buffer,
-        num_indices: indices.len() as u32,
-    })
+    sub_paths
 }
 
-/// Expand a polyline into a thick stroke (quads = 2 triangles per segment).
-fn expand_stroke_path(
+/// Compute the perpendicular normal of a line segment, scaled by half_width.
+fn segment_normal(p0: [f32; 2], p1: [f32; 2], half_width: f32) -> Option<[f32; 2]> {
+    let dx = p1[0] - p0[0];
+    let dy = p1[1] - p0[1];
+    let len = (dx * dx + dy * dy).sqrt();
+    if len < 1e-6 {
+        return None;
+    }
+    Some([-dy / len * half_width, dx / len * half_width])
+}
+
+/// Number of segments used to approximate a round cap or round join.
+const ROUND_CAP_SEGMENTS: usize = 8;
+
+/// Add a line cap to the stroke geometry (color vertices).
+fn add_cap_color(
+    point: [f32; 2],
+    normal: [f32; 2],
+    direction: [f32; 2],  // unit direction vector outward from the stroke endpoint
+    half_width: f32,
+    cap_style: LineCapStyle,
+    color: [f32; 4],
+    vertices: &mut Vec<BezierVertex>,
+    indices: &mut Vec<u32>,
+) {
+    match cap_style {
+        LineCapStyle::None => {
+            // Butt cap: no extension. Already handled by the segment quads.
+        }
+        LineCapStyle::Square => {
+            // Extend the stroke by half_width in the direction.
+            let ext = [direction[0] * half_width, direction[1] * half_width];
+            let base = vertices.len() as u32;
+            // The 4 corners of the square cap.
+            vertices.push(BezierVertex {
+                position: [point[0] + normal[0], point[1] + normal[1]],
+                uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+            });
+            vertices.push(BezierVertex {
+                position: [point[0] - normal[0], point[1] - normal[1]],
+                uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+            });
+            vertices.push(BezierVertex {
+                position: [point[0] + normal[0] + ext[0], point[1] + normal[1] + ext[1]],
+                uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+            });
+            vertices.push(BezierVertex {
+                position: [point[0] - normal[0] + ext[0], point[1] - normal[1] + ext[1]],
+                uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+            });
+            indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+        }
+        LineCapStyle::Round => {
+            // Semicircle fan at the endpoint.
+            let center_idx = vertices.len() as u32;
+            vertices.push(BezierVertex {
+                position: point,
+                uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+            });
+            // Compute the start angle from the normal.
+            let start_angle = normal[1].atan2(normal[0]);
+            for i in 0..=ROUND_CAP_SEGMENTS {
+                let angle = start_angle + std::f32::consts::PI * (i as f32 / ROUND_CAP_SEGMENTS as f32);
+                let vx = point[0] + angle.cos() * half_width;
+                let vy = point[1] + angle.sin() * half_width;
+                let idx = vertices.len() as u32;
+                vertices.push(BezierVertex {
+                    position: [vx, vy],
+                    uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+                });
+                if i > 0 {
+                    indices.extend_from_slice(&[center_idx, idx - 1, idx]);
+                }
+            }
+        }
+    }
+}
+
+/// Add a line join at a vertex where two segments meet (color vertices).
+fn add_join_color(
+    point: [f32; 2],
+    n0: [f32; 2],   // normal of incoming segment
+    n1: [f32; 2],   // normal of outgoing segment
+    half_width: f32,
+    join_style: LineJoinStyle,
+    color: [f32; 4],
+    vertices: &mut Vec<BezierVertex>,
+    indices: &mut Vec<u32>,
+) {
+    // Determine which side the join is on using the cross product.
+    let cross = n0[0] * n1[1] - n0[1] * n1[0];
+    if cross.abs() < 1e-6 {
+        // Segments are nearly parallel, no join needed.
+        return;
+    }
+
+    match join_style {
+        LineJoinStyle::Miter(miter_limit) => {
+            // Compute the miter point.
+            let dot = n0[0] * n1[0] + n0[1] * n1[1];
+            let hw_sq = half_width * half_width;
+            let cos_half = ((1.0 + dot / hw_sq) / 2.0).sqrt().max(1e-6);
+            let miter_length = half_width / cos_half;
+            let limit = miter_limit.to_f32() * half_width;
+
+            if miter_length <= limit {
+                // Miter: extend to the intersection point.
+                let avg_n = [
+                    (n0[0] + n1[0]) / (2.0 * cos_half * cos_half),
+                    (n0[1] + n1[1]) / (2.0 * cos_half * cos_half),
+                ];
+                // Fill the miter triangle on the outer side.
+                let base = vertices.len() as u32;
+                if cross > 0.0 {
+                    // Join is on the +normal side.
+                    vertices.push(BezierVertex {
+                        position: point,
+                        uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+                    });
+                    vertices.push(BezierVertex {
+                        position: [point[0] + n0[0], point[1] + n0[1]],
+                        uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+                    });
+                    vertices.push(BezierVertex {
+                        position: [point[0] + avg_n[0], point[1] + avg_n[1]],
+                        uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+                    });
+                    vertices.push(BezierVertex {
+                        position: [point[0] + n1[0], point[1] + n1[1]],
+                        uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+                    });
+                    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                } else {
+                    vertices.push(BezierVertex {
+                        position: point,
+                        uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+                    });
+                    vertices.push(BezierVertex {
+                        position: [point[0] - n0[0], point[1] - n0[1]],
+                        uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+                    });
+                    vertices.push(BezierVertex {
+                        position: [point[0] - avg_n[0], point[1] - avg_n[1]],
+                        uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+                    });
+                    vertices.push(BezierVertex {
+                        position: [point[0] - n1[0], point[1] - n1[1]],
+                        uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+                    });
+                    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                }
+            } else {
+                // Miter limit exceeded: fall back to bevel.
+                add_bevel_color(point, n0, n1, cross, color, vertices, indices);
+            }
+        }
+        LineJoinStyle::Bevel => {
+            add_bevel_color(point, n0, n1, cross, color, vertices, indices);
+        }
+        LineJoinStyle::Round => {
+            // Arc fan between the two normals.
+            let angle0 = n0[1].atan2(n0[0]);
+            let angle1 = n1[1].atan2(n1[0]);
+            let mut sweep = angle1 - angle0;
+            if cross > 0.0 {
+                if sweep < 0.0 { sweep += 2.0 * std::f32::consts::PI; }
+            } else {
+                if sweep > 0.0 { sweep -= 2.0 * std::f32::consts::PI; }
+            }
+
+            let steps = ((sweep.abs() / std::f32::consts::PI * ROUND_CAP_SEGMENTS as f32).ceil() as usize).max(2);
+            let center_idx = vertices.len() as u32;
+            vertices.push(BezierVertex {
+                position: point,
+                uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+            });
+            for i in 0..=steps {
+                let angle = angle0 + sweep * (i as f32 / steps as f32);
+                let vx = point[0] + angle.cos() * half_width;
+                let vy = point[1] + angle.sin() * half_width;
+                let idx = vertices.len() as u32;
+                vertices.push(BezierVertex {
+                    position: [vx, vy],
+                    uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+                });
+                if i > 0 {
+                    indices.extend_from_slice(&[center_idx, idx - 1, idx]);
+                }
+            }
+        }
+    }
+}
+
+/// Add a bevel join triangle (color).
+fn add_bevel_color(
+    point: [f32; 2],
+    n0: [f32; 2],
+    n1: [f32; 2],
+    cross: f32,
+    color: [f32; 4],
+    vertices: &mut Vec<BezierVertex>,
+    indices: &mut Vec<u32>,
+) {
+    let base = vertices.len() as u32;
+    vertices.push(BezierVertex {
+        position: point,
+        uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+    });
+    if cross > 0.0 {
+        vertices.push(BezierVertex {
+            position: [point[0] + n0[0], point[1] + n0[1]],
+            uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+        });
+        vertices.push(BezierVertex {
+            position: [point[0] + n1[0], point[1] + n1[1]],
+            uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+        });
+    } else {
+        vertices.push(BezierVertex {
+            position: [point[0] - n0[0], point[1] - n0[1]],
+            uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+        });
+        vertices.push(BezierVertex {
+            position: [point[0] - n1[0], point[1] - n1[1]],
+            uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+        });
+    }
+    indices.extend_from_slice(&[base, base + 1, base + 2]);
+}
+
+/// Expand a polyline into a thick stroke with caps and joins (color vertices).
+fn expand_stroke_path_color(
     points: &[[f32; 2]],
     half_width: f32,
     color: [f32; 4],
+    is_closed: bool,
+    start_cap: LineCapStyle,
+    end_cap: LineCapStyle,
+    join_style: LineJoinStyle,
     vertices: &mut Vec<BezierVertex>,
     indices: &mut Vec<u32>,
 ) {
@@ -813,61 +1194,322 @@ fn expand_stroke_path(
         return;
     }
 
+    // Collect segment normals.
+    let mut normals: Vec<[f32; 2]> = Vec::new();
+    let mut directions: Vec<[f32; 2]> = Vec::new();
     for i in 0..points.len() - 1 {
-        let p0 = points[i];
-        let p1 = points[i + 1];
-
-        let dx = p1[0] - p0[0];
-        let dy = p1[1] - p0[1];
+        let dx = points[i + 1][0] - points[i][0];
+        let dy = points[i + 1][1] - points[i][1];
         let len = (dx * dx + dy * dy).sqrt();
         if len < 1e-6 {
-            continue;
+            // Use previous normal or zero.
+            normals.push(*normals.last().unwrap_or(&[0.0, half_width]));
+            directions.push(*directions.last().unwrap_or(&[1.0, 0.0]));
+        } else {
+            normals.push([-dy / len * half_width, dx / len * half_width]);
+            directions.push([dx / len, dy / len]);
         }
+    }
 
-        // Perpendicular normal.
-        let nx = -dy / len * half_width;
-        let ny = dx / len * half_width;
+    if normals.is_empty() {
+        return;
+    }
+
+    // Emit segment quads.
+    for i in 0..normals.len() {
+        let p0 = points[i];
+        let p1 = points[i + 1];
+        let n = normals[i];
 
         let base = vertices.len() as u32;
+        vertices.push(BezierVertex {
+            position: [p0[0] + n[0], p0[1] + n[1]],
+            uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+        });
+        vertices.push(BezierVertex {
+            position: [p0[0] - n[0], p0[1] - n[1]],
+            uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+        });
+        vertices.push(BezierVertex {
+            position: [p1[0] + n[0], p1[1] + n[1]],
+            uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+        });
+        vertices.push(BezierVertex {
+            position: [p1[0] - n[0], p1[1] - n[1]],
+            uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
+        });
+        indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+    }
 
-        // Four corners of the stroke quad.
-        vertices.push(BezierVertex {
-            position: [p0[0] + nx, p0[1] + ny],
-            uv: [0.0, 0.0],
-            fill_type: 0,
-            color,
-            _pad: 0,
-        });
-        vertices.push(BezierVertex {
-            position: [p0[0] - nx, p0[1] - ny],
-            uv: [0.0, 0.0],
-            fill_type: 0,
-            color,
-            _pad: 0,
-        });
-        vertices.push(BezierVertex {
-            position: [p1[0] + nx, p1[1] + ny],
-            uv: [0.0, 0.0],
-            fill_type: 0,
-            color,
-            _pad: 0,
-        });
-        vertices.push(BezierVertex {
-            position: [p1[0] - nx, p1[1] - ny],
-            uv: [0.0, 0.0],
-            fill_type: 0,
-            color,
-            _pad: 0,
-        });
+    // Emit joins at interior vertices.
+    for i in 0..normals.len().saturating_sub(1) {
+        let join_point = points[i + 1];
+        add_join_color(
+            join_point, normals[i], normals[i + 1],
+            half_width, join_style, color, vertices, indices,
+        );
+    }
 
-        // Two triangles for the quad.
-        indices.push(base);
-        indices.push(base + 1);
-        indices.push(base + 2);
+    // Handle caps or closing join.
+    if is_closed && normals.len() >= 2 {
+        // Closing join between last and first segment.
+        add_join_color(
+            points[points.len() - 1],
+            *normals.last().unwrap(),
+            normals[0],
+            half_width, join_style, color, vertices, indices,
+        );
+    } else {
+        // Start cap.
+        let dir0 = directions[0];
+        add_cap_color(
+            points[0], normals[0],
+            [-dir0[0], -dir0[1]],  // outward = opposite of first segment direction
+            half_width, start_cap, color, vertices, indices,
+        );
+        // End cap.
+        let last_dir = *directions.last().unwrap();
+        let last_norm = *normals.last().unwrap();
+        add_cap_color(
+            *points.last().unwrap(), last_norm,
+            last_dir,  // outward = same as last segment direction
+            half_width, end_cap, color, vertices, indices,
+        );
+    }
+}
 
-        indices.push(base + 1);
-        indices.push(base + 3);
-        indices.push(base + 2);
+// ---- Tex vertex versions for gradient/bitmap strokes ----
+
+/// Add a line cap (tex vertices, for gradient/bitmap strokes).
+fn add_cap_tex(
+    point: [f32; 2],
+    normal: [f32; 2],
+    direction: [f32; 2],
+    half_width: f32,
+    cap_style: LineCapStyle,
+    vertices: &mut Vec<BezierTexVertex>,
+    indices: &mut Vec<u32>,
+) {
+    match cap_style {
+        LineCapStyle::None => {}
+        LineCapStyle::Square => {
+            let ext = [direction[0] * half_width, direction[1] * half_width];
+            let base = vertices.len() as u32;
+            vertices.push(BezierTexVertex {
+                position: [point[0] + normal[0], point[1] + normal[1]],
+                uv: [0.0, 0.0], fill_type: 0, _pad: 0,
+            });
+            vertices.push(BezierTexVertex {
+                position: [point[0] - normal[0], point[1] - normal[1]],
+                uv: [0.0, 0.0], fill_type: 0, _pad: 0,
+            });
+            vertices.push(BezierTexVertex {
+                position: [point[0] + normal[0] + ext[0], point[1] + normal[1] + ext[1]],
+                uv: [0.0, 0.0], fill_type: 0, _pad: 0,
+            });
+            vertices.push(BezierTexVertex {
+                position: [point[0] - normal[0] + ext[0], point[1] - normal[1] + ext[1]],
+                uv: [0.0, 0.0], fill_type: 0, _pad: 0,
+            });
+            indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+        }
+        LineCapStyle::Round => {
+            let center_idx = vertices.len() as u32;
+            vertices.push(BezierTexVertex {
+                position: point,
+                uv: [0.0, 0.0], fill_type: 0, _pad: 0,
+            });
+            let start_angle = normal[1].atan2(normal[0]);
+            for i in 0..=ROUND_CAP_SEGMENTS {
+                let angle = start_angle + std::f32::consts::PI * (i as f32 / ROUND_CAP_SEGMENTS as f32);
+                let vx = point[0] + angle.cos() * half_width;
+                let vy = point[1] + angle.sin() * half_width;
+                let idx = vertices.len() as u32;
+                vertices.push(BezierTexVertex {
+                    position: [vx, vy],
+                    uv: [0.0, 0.0], fill_type: 0, _pad: 0,
+                });
+                if i > 0 {
+                    indices.extend_from_slice(&[center_idx, idx - 1, idx]);
+                }
+            }
+        }
+    }
+}
+
+/// Add a line join (tex vertices, for gradient/bitmap strokes).
+fn add_join_tex(
+    point: [f32; 2],
+    n0: [f32; 2],
+    n1: [f32; 2],
+    half_width: f32,
+    join_style: LineJoinStyle,
+    vertices: &mut Vec<BezierTexVertex>,
+    indices: &mut Vec<u32>,
+) {
+    let cross = n0[0] * n1[1] - n0[1] * n1[0];
+    if cross.abs() < 1e-6 {
+        return;
+    }
+
+    match join_style {
+        LineJoinStyle::Miter(miter_limit) => {
+            let dot = n0[0] * n1[0] + n0[1] * n1[1];
+            let hw_sq = half_width * half_width;
+            let cos_half = ((1.0 + dot / hw_sq) / 2.0).sqrt().max(1e-6);
+            let miter_length = half_width / cos_half;
+            let limit = miter_limit.to_f32() * half_width;
+
+            if miter_length <= limit {
+                let avg_n = [
+                    (n0[0] + n1[0]) / (2.0 * cos_half * cos_half),
+                    (n0[1] + n1[1]) / (2.0 * cos_half * cos_half),
+                ];
+                let base = vertices.len() as u32;
+                if cross > 0.0 {
+                    vertices.push(BezierTexVertex { position: point, uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+                    vertices.push(BezierTexVertex { position: [point[0] + n0[0], point[1] + n0[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+                    vertices.push(BezierTexVertex { position: [point[0] + avg_n[0], point[1] + avg_n[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+                    vertices.push(BezierTexVertex { position: [point[0] + n1[0], point[1] + n1[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+                } else {
+                    vertices.push(BezierTexVertex { position: point, uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+                    vertices.push(BezierTexVertex { position: [point[0] - n0[0], point[1] - n0[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+                    vertices.push(BezierTexVertex { position: [point[0] - avg_n[0], point[1] - avg_n[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+                    vertices.push(BezierTexVertex { position: [point[0] - n1[0], point[1] - n1[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+                }
+                indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            } else {
+                add_bevel_tex(point, n0, n1, cross, vertices, indices);
+            }
+        }
+        LineJoinStyle::Bevel => {
+            add_bevel_tex(point, n0, n1, cross, vertices, indices);
+        }
+        LineJoinStyle::Round => {
+            let angle0 = n0[1].atan2(n0[0]);
+            let angle1 = n1[1].atan2(n1[0]);
+            let mut sweep = angle1 - angle0;
+            if cross > 0.0 {
+                if sweep < 0.0 { sweep += 2.0 * std::f32::consts::PI; }
+            } else {
+                if sweep > 0.0 { sweep -= 2.0 * std::f32::consts::PI; }
+            }
+            let steps = ((sweep.abs() / std::f32::consts::PI * ROUND_CAP_SEGMENTS as f32).ceil() as usize).max(2);
+            let center_idx = vertices.len() as u32;
+            vertices.push(BezierTexVertex { position: point, uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+            for i in 0..=steps {
+                let angle = angle0 + sweep * (i as f32 / steps as f32);
+                let vx = point[0] + angle.cos() * half_width;
+                let vy = point[1] + angle.sin() * half_width;
+                let idx = vertices.len() as u32;
+                vertices.push(BezierTexVertex { position: [vx, vy], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+                if i > 0 {
+                    indices.extend_from_slice(&[center_idx, idx - 1, idx]);
+                }
+            }
+        }
+    }
+}
+
+/// Add a bevel join triangle (tex).
+fn add_bevel_tex(
+    point: [f32; 2],
+    n0: [f32; 2],
+    n1: [f32; 2],
+    cross: f32,
+    vertices: &mut Vec<BezierTexVertex>,
+    indices: &mut Vec<u32>,
+) {
+    let base = vertices.len() as u32;
+    vertices.push(BezierTexVertex { position: point, uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+    if cross > 0.0 {
+        vertices.push(BezierTexVertex { position: [point[0] + n0[0], point[1] + n0[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+        vertices.push(BezierTexVertex { position: [point[0] + n1[0], point[1] + n1[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+    } else {
+        vertices.push(BezierTexVertex { position: [point[0] - n0[0], point[1] - n0[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+        vertices.push(BezierTexVertex { position: [point[0] - n1[0], point[1] - n1[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+    }
+    indices.extend_from_slice(&[base, base + 1, base + 2]);
+}
+
+/// Expand a polyline into a thick stroke with caps and joins (tex vertices).
+fn expand_stroke_path_tex(
+    points: &[[f32; 2]],
+    half_width: f32,
+    is_closed: bool,
+    start_cap: LineCapStyle,
+    end_cap: LineCapStyle,
+    join_style: LineJoinStyle,
+    vertices: &mut Vec<BezierTexVertex>,
+    indices: &mut Vec<u32>,
+) {
+    if points.len() < 2 {
+        return;
+    }
+
+    let mut normals: Vec<[f32; 2]> = Vec::new();
+    let mut directions: Vec<[f32; 2]> = Vec::new();
+    for i in 0..points.len() - 1 {
+        let dx = points[i + 1][0] - points[i][0];
+        let dy = points[i + 1][1] - points[i][1];
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 1e-6 {
+            normals.push(*normals.last().unwrap_or(&[0.0, half_width]));
+            directions.push(*directions.last().unwrap_or(&[1.0, 0.0]));
+        } else {
+            normals.push([-dy / len * half_width, dx / len * half_width]);
+            directions.push([dx / len, dy / len]);
+        }
+    }
+
+    if normals.is_empty() {
+        return;
+    }
+
+    // Emit segment quads.
+    for i in 0..normals.len() {
+        let p0 = points[i];
+        let p1 = points[i + 1];
+        let n = normals[i];
+
+        let base = vertices.len() as u32;
+        vertices.push(BezierTexVertex { position: [p0[0] + n[0], p0[1] + n[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+        vertices.push(BezierTexVertex { position: [p0[0] - n[0], p0[1] - n[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+        vertices.push(BezierTexVertex { position: [p1[0] + n[0], p1[1] + n[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+        vertices.push(BezierTexVertex { position: [p1[0] - n[0], p1[1] - n[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+        indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+    }
+
+    // Joins.
+    for i in 0..normals.len().saturating_sub(1) {
+        add_join_tex(
+            points[i + 1], normals[i], normals[i + 1],
+            half_width, join_style, vertices, indices,
+        );
+    }
+
+    // Caps or closing join.
+    if is_closed && normals.len() >= 2 {
+        add_join_tex(
+            points[points.len() - 1],
+            *normals.last().unwrap(),
+            normals[0],
+            half_width, join_style, vertices, indices,
+        );
+    } else {
+        let dir0 = directions[0];
+        add_cap_tex(
+            points[0], normals[0],
+            [-dir0[0], -dir0[1]],
+            half_width, start_cap, vertices, indices,
+        );
+        let last_dir = *directions.last().unwrap();
+        let last_norm = *normals.last().unwrap();
+        add_cap_tex(
+            *points.last().unwrap(), last_norm,
+            last_dir,
+            half_width, end_cap, vertices, indices,
+        );
     }
 }
 

@@ -11,7 +11,7 @@
 //! - **Stencil masking**: PushMask / ActivateMask / DeactivateMask / PopMask.
 //! - **Blend modes**: Sub-command rendering (blend modes not yet fully supported).
 
-use crate::blend::{BlendType, TrivialBlend};
+use crate::blend::{BlendType, ComplexBlend, TrivialBlend};
 use crate::mesh::{self, BezierMesh, DrawType, as_bezier_mesh};
 use crate::pipelines::{BindLayouts, Pipelines};
 use crate::shaders::Shaders;
@@ -198,6 +198,22 @@ pub struct BezierRenderBackend<T: RenderTarget> {
     // Cached bitmap bind groups for RenderBitmap commands.
     // Maps bitmap handle pointer to (bind_group, texture_width, texture_height).
     bitmap_bind_cache: std::collections::HashMap<usize, (wgpu::BindGroup, u32, u32)>,
+
+    // Complex blend compositing support:
+    // blend_buffer: Snapshot of the framebuffer before a complex blend operation.
+    // Used as the "parent" texture in blend compositing shaders.
+    blend_buffer: Option<wgpu::Texture>,
+    blend_buffer_view: Option<wgpu::TextureView>,
+
+    // Offscreen framebuffer for rendering (supports COPY_SRC for blend compositing).
+    // When complex blends are needed, we render to this texture instead of the
+    // swapchain directly, then blit to the swapchain at the end.
+    offscreen_buffer: Option<wgpu::Texture>,
+    offscreen_view: Option<wgpu::TextureView>,
+
+    // Copy pipeline for blitting textures (used for render_offscreen and blend compositing).
+    copy_pipeline: wgpu::RenderPipeline,
+    copy_bind_layout: wgpu::BindGroupLayout,
 }
 
 impl<T: RenderTarget> BezierRenderBackend<T> {
@@ -283,6 +299,64 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
         let (depth_stencil_texture, depth_stencil_view) =
             create_depth_stencil(&device, width, height, 1);
 
+        // Copy pipeline bind layout (for copy/blit operations).
+        let copy_bind_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Copy bind layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let copy_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Copy pipeline layout"),
+            bind_group_layouts: &[&copy_bind_layout],
+            push_constant_ranges: &[],
+        });
+        let copy_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Copy pipeline"),
+            layout: Some(&copy_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shaders.copy,
+                entry_point: Some("main_vertex"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shaders.copy,
+                entry_point: Some("main_fragment"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         Ok(Self {
             device,
             queue,
@@ -312,6 +386,12 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
             mask_state: MaskState::NoMask,
             num_masks: 0,
             bitmap_bind_cache: std::collections::HashMap::new(),
+            blend_buffer: None,
+            blend_buffer_view: None,
+            offscreen_buffer: None,
+            offscreen_view: None,
+            copy_pipeline,
+            copy_bind_layout,
         })
     }
 
@@ -494,13 +574,23 @@ impl<T: RenderTarget> RenderBackend for BezierRenderBackend<T> {
     ) -> ShapeHandle {
         let mut bitmap_handles = std::collections::HashMap::new();
         for path in &shape.paths {
-            if let DrawPath::Fill {
-                style: FillStyle::Bitmap { id, .. },
-                ..
-            } = path
-            {
-                if let Some(handle) = bitmap_source.bitmap_handle(*id, self) {
-                    bitmap_handles.insert(*id, handle);
+            let fill_style = match path {
+                DrawPath::Fill {
+                    style: FillStyle::Bitmap { id, .. },
+                    ..
+                } => Some(*id),
+                DrawPath::Stroke { style, .. } => {
+                    if let FillStyle::Bitmap { id, .. } = style.fill_style() {
+                        Some(*id)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(id) = fill_style {
+                if let Some(handle) = bitmap_source.bitmap_handle(id, self) {
+                    bitmap_handles.insert(id, handle);
                 }
             }
         }
@@ -559,69 +649,95 @@ impl<T: RenderTarget> RenderBackend for BezierRenderBackend<T> {
         self.collect_transforms(&commands);
         self.upload_transforms();
 
+        // Check if we need an offscreen buffer for complex blend compositing.
+        let needs_offscreen = self.has_complex_blends(&commands);
+        if needs_offscreen {
+            self.ensure_offscreen_buffer();
+            self.ensure_blend_buffer();
+        }
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Frame encoder"),
             });
 
-        {
-            let clear_color = wgpu::Color {
-                r: f64::from(clear.r) / 255.0,
-                g: f64::from(clear.g) / 255.0,
-                b: f64::from(clear.b) / 255.0,
-                a: f64::from(clear.a) / 255.0,
-            };
+        let clear_color = wgpu::Color {
+            r: f64::from(clear.r) / 255.0,
+            g: f64::from(clear.g) / 255.0,
+            b: f64::from(clear.b) / 255.0,
+            a: f64::from(clear.a) / 255.0,
+        };
 
-            // When MSAA is enabled, render to the MSAA texture and resolve to frame.
-            let (render_view, resolve_target) = if self.sample_count > 1 {
-                if let Some(msaa_view) = &self.msaa_view {
-                    (msaa_view as &wgpu::TextureView, Some(frame_view))
-                } else {
-                    (frame_view, None)
-                }
-            } else {
-                (frame_view, None)
-            };
-
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Main render pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: render_view,
-                    resolve_target,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_stencil_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(0.0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(0),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                }),
-                ..Default::default()
-            });
-
-            // Set global bind group.
-            render_pass.set_bind_group(0, &self.globals_bind_group, &[]);
-
-            // Execute draw commands.
+        if needs_offscreen {
+            // Render to offscreen buffer (supports COPY_SRC for blend compositing).
+            // Note: offscreen buffer is always single-sampled. When MSAA is enabled,
+            // we use self.msaa_view as the render target and resolve into offscreen.
+            let offscreen_view = self.offscreen_view.as_ref().unwrap();
             let mut transform_index = 0u32;
             let mut mask_state = MaskState::NoMask;
             let mut num_masks = 0u32;
-            self.execute_commands(
-                &mut render_pass,
+            self.execute_toplevel(
+                &mut encoder,
+                offscreen_view,
+                self.msaa_view.as_ref(),
+                Some(clear_color),
                 &commands,
                 &mut transform_index,
                 &mut mask_state,
                 &mut num_masks,
+                None,
+            );
+
+            // Blit offscreen buffer to swapchain.
+            let blit_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Blit to swapchain"),
+                layout: &self.copy_bind_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(offscreen_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.default_sampler),
+                    },
+                ],
+            });
+
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Blit to swapchain pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: frame_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            render_pass.set_pipeline(&self.copy_pipeline);
+            render_pass.set_bind_group(0, &blit_bind_group, &[]);
+            render_pass.draw(0..3, 0..1);
+        } else {
+            // Simple path: render directly to swapchain.
+            // When MSAA is enabled, render to msaa_view and resolve to frame_view.
+            let mut transform_index = 0u32;
+            let mut mask_state = MaskState::NoMask;
+            let mut num_masks = 0u32;
+            self.execute_toplevel(
+                &mut encoder,
+                frame_view,
+                self.msaa_view.as_ref(),
+                Some(clear_color),
+                &commands,
+                &mut transform_index,
+                &mut mask_state,
+                &mut num_masks,
+                None,
             );
         }
 
@@ -917,6 +1033,87 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
         }
     }
 
+    /// Check if a command list contains any complex blend commands (recursively).
+    fn has_complex_blends(&self, commands: &CommandList) -> bool {
+        use ruffle_render::commands::Command;
+        for cmd in &commands.commands {
+            match cmd {
+                Command::Blend(_, mode) => {
+                    if matches!(BlendType::from(mode.clone()), BlendType::Complex(_)) {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Ensure the offscreen framebuffer exists at the current viewport size.
+    fn ensure_offscreen_buffer(&mut self) {
+        let width = self.viewport_width.max(1);
+        let height = self.viewport_height.max(1);
+
+        let needs_recreate = match &self.offscreen_buffer {
+            Some(tex) => tex.width() != width || tex.height() != height,
+            None => true,
+        };
+
+        if needs_recreate {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Offscreen framebuffer"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.surface_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            self.offscreen_buffer = Some(texture);
+            self.offscreen_view = Some(view);
+        }
+    }
+
+    /// Ensure the blend buffer (framebuffer snapshot) exists at the current viewport size.
+    fn ensure_blend_buffer(&mut self) {
+        let width = self.viewport_width.max(1);
+        let height = self.viewport_height.max(1);
+
+        let needs_recreate = match &self.blend_buffer {
+            Some(tex) => tex.width() != width || tex.height() != height,
+            None => true,
+        };
+
+        if needs_recreate {
+            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Blend buffer (parent snapshot)"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.surface_format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            self.blend_buffer = Some(texture);
+            self.blend_buffer_view = Some(view);
+        }
+    }
+
     /// Execute draw commands within an active render pass.
     fn execute_commands<'a>(
         &'a self,
@@ -925,15 +1122,35 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
         transform_index: &mut u32,
         mask_state: &mut MaskState,
         num_masks: &mut u32,
+        blend_override: Option<TrivialBlend>,
+    ) {
+        for cmd in &commands.commands {
+            self.execute_single_command(render_pass, cmd, transform_index, mask_state, num_masks, blend_override);
+        }
+    }
+
+    /// Execute a single draw command within an active render pass.
+    fn execute_single_command<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        cmd: &'a ruffle_render::commands::Command,
+        transform_index: &mut u32,
+        mask_state: &mut MaskState,
+        num_masks: &mut u32,
+        blend_override: Option<TrivialBlend>,
     ) {
         use ruffle_render::commands::Command;
-        for cmd in &commands.commands {
-            match cmd {
+        match cmd {
                 Command::RenderShape { shape, .. } => {
                     let offset = self.transform_offset(*transform_index);
                     *transform_index += 1;
 
-                    let pipelines = self.pipelines.for_mask_state(*mask_state);
+                    let pipelines = match blend_override {
+                        Some(blend) if *mask_state == MaskState::NoMask => {
+                            self.pipelines.for_trivial_blend(blend)
+                        }
+                        _ => self.pipelines.for_mask_state(*mask_state),
+                    };
                     let mesh = as_bezier_mesh(shape);
                     for draw in &mesh.draws {
                         match &draw.draw_type {
@@ -969,7 +1186,12 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
 
                     let key = Arc::as_ptr(&bitmap.0) as *const () as usize;
                     if let Some((bind_group, _w, _h)) = self.bitmap_bind_cache.get(&key) {
-                        let pipelines = self.pipelines.for_mask_state(*mask_state);
+                        let pipelines = match blend_override {
+                            Some(blend) if *mask_state == MaskState::NoMask => {
+                                self.pipelines.for_trivial_blend(blend)
+                            }
+                            _ => self.pipelines.for_mask_state(*mask_state),
+                        };
                         render_pass.set_pipeline(&pipelines.render_bitmap);
                         render_pass.set_bind_group(1, &self.transform_bind_group, &[offset]);
                         render_pass.set_bind_group(2, bind_group, &[]);
@@ -989,7 +1211,12 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
                     let offset = self.transform_offset(*transform_index);
                     *transform_index += 1;
 
-                    let pipelines = self.pipelines.for_mask_state(*mask_state);
+                    let pipelines = match blend_override {
+                        Some(blend) if *mask_state == MaskState::NoMask => {
+                            self.pipelines.for_trivial_blend(blend)
+                        }
+                        _ => self.pipelines.for_mask_state(*mask_state),
+                    };
                     render_pass.set_pipeline(&pipelines.color_fill);
                     render_pass.set_bind_group(1, &self.transform_bind_group, &[offset]);
                     render_pass.set_vertex_buffer(0, self.unit_quad.color_vertex_buffer.slice(..));
@@ -1010,7 +1237,12 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
                     // For simplicity, we draw the line as a very thin quad.
                     // The unit quad top edge (vertex 0 and 1) represents the line.
                     // We render the full unit quad scaled so that height is ~1px.
-                    let pipelines = self.pipelines.for_mask_state(*mask_state);
+                    let pipelines = match blend_override {
+                        Some(blend) if *mask_state == MaskState::NoMask => {
+                            self.pipelines.for_trivial_blend(blend)
+                        }
+                        _ => self.pipelines.for_mask_state(*mask_state),
+                    };
                     render_pass.set_pipeline(&pipelines.color_fill);
                     render_pass.set_bind_group(1, &self.transform_bind_group, &[offset]);
                     render_pass.set_vertex_buffer(0, self.unit_quad.color_vertex_buffer.slice(..));
@@ -1032,7 +1264,12 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
                 }
                 Command::DrawLineRect { .. } => {
                     // Draw 4 thin quads (one per edge of the rectangle).
-                    let pipelines = self.pipelines.for_mask_state(*mask_state);
+                    let pipelines = match blend_override {
+                        Some(blend) if *mask_state == MaskState::NoMask => {
+                            self.pipelines.for_trivial_blend(blend)
+                        }
+                        _ => self.pipelines.for_mask_state(*mask_state),
+                    };
                     render_pass.set_pipeline(&pipelines.color_fill);
                     render_pass.set_vertex_buffer(0, self.unit_quad.color_vertex_buffer.slice(..));
                     render_pass.set_index_buffer(
@@ -1072,28 +1309,18 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
                     match BlendType::from(blend_mode.clone()) {
                         BlendType::Trivial(TrivialBlend::Normal) => {
                             // Normal blend: just render sub-commands directly.
-                            self.execute_commands(render_pass, sub_commands, transform_index, mask_state, num_masks);
+                            self.execute_commands(render_pass, sub_commands, transform_index, mask_state, num_masks, blend_override);
                         }
-                        BlendType::Trivial(_trivial) => {
+                        BlendType::Trivial(trivial) => {
                             // Other trivial blends (Add, Subtract, Screen):
-                            // Ideally we'd switch pipeline blend state, but that
-                            // requires separate pipeline sets per blend mode.
-                            // For now, render directly (equivalent to Normal).
-                            // TODO: Create per-trivial-blend pipeline sets.
-                            self.execute_commands(render_pass, sub_commands, transform_index, mask_state, num_masks);
+                            // Use dedicated pipeline sets with the proper blend state.
+                            self.execute_commands(render_pass, sub_commands, transform_index, mask_state, num_masks, Some(trivial));
                         }
                         BlendType::Complex(_complex) => {
-                            // Complex blends require render-to-texture compositing.
-                            // This cannot be done within the current render pass
-                            // since we need to read from the framebuffer.
-                            // For now, render sub-commands directly as a fallback.
-                            // Full implementation requires:
-                            // 1. End current render pass
-                            // 2. Render sub-commands to intermediate texture
-                            // 3. Copy current framebuffer to another texture
-                            // 4. Composite both using the blend shader
-                            // 5. Resume main render pass
-                            self.execute_commands(render_pass, sub_commands, transform_index, mask_state, num_masks);
+                            // Complex blends handled at the toplevel where we can break
+                            // out of the render pass. When called from within a render pass,
+                            // we fall back to Normal blending since we can't end the pass here.
+                            self.execute_commands(render_pass, sub_commands, transform_index, mask_state, num_masks, blend_override);
                         }
                     }
                 }
@@ -1108,14 +1335,14 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
                     render_pass.set_stencil_reference(*num_masks - 1);
 
                     // 2. Draw mask geometry (writes to stencil, not color).
-                    self.execute_commands(render_pass, mask_commands, transform_index, mask_state, num_masks);
+                    self.execute_commands(render_pass, mask_commands, transform_index, mask_state, num_masks, None);
 
                     // 3. Activate mask: switch to drawing masked content.
                     *mask_state = MaskState::DrawMaskedContent;
                     render_pass.set_stencil_reference(*num_masks);
 
                     // 4. Draw the maskee (only where stencil passes).
-                    self.execute_commands(render_pass, maskee_commands, transform_index, mask_state, num_masks);
+                    self.execute_commands(render_pass, maskee_commands, transform_index, mask_state, num_masks, blend_override);
 
                     // 5. Deactivate and clear mask.
                     *mask_state = MaskState::ClearMaskStencil;
@@ -1133,6 +1360,354 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
                     }
                 }
             }
+    }
+
+    /// Build a color attachment for a render pass, handling MSAA resolve.
+    /// When `msaa_view` is provided, render to the MSAA texture and resolve to `target_view`.
+    /// Otherwise render directly to `target_view`.
+    fn make_color_attachment<'a>(
+        target_view: &'a wgpu::TextureView,
+        msaa_view: Option<&'a wgpu::TextureView>,
+        load: wgpu::LoadOp<wgpu::Color>,
+    ) -> wgpu::RenderPassColorAttachment<'a> {
+        if let Some(msaa) = msaa_view {
+            wgpu::RenderPassColorAttachment {
+                view: msaa,
+                resolve_target: Some(target_view),
+                ops: wgpu::Operations {
+                    load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            }
+        } else {
+            wgpu::RenderPassColorAttachment {
+                view: target_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load,
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            }
+        }
+    }
+
+    /// Top-level command execution that manages render pass lifecycle.
+    /// This method can break out of render passes to handle complex blend modes
+    /// which require render-to-texture compositing.
+    ///
+    /// `msaa_view` should be provided when MSAA is enabled (sample_count > 1).
+    /// It must be the same size as `target_view` and have the appropriate sample count.
+    fn execute_toplevel(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target_view: &wgpu::TextureView,
+        msaa_view: Option<&wgpu::TextureView>,
+        clear_color: Option<wgpu::Color>,
+        commands: &CommandList,
+        transform_index: &mut u32,
+        mask_state: &mut MaskState,
+        num_masks: &mut u32,
+        blend_override: Option<TrivialBlend>,
+    ) {
+        use ruffle_render::commands::Command;
+
+        // Scan the command list for complex blends.
+        // If there are none, we can use a single render pass.
+        let has_complex_blends = commands.commands.iter().any(|cmd| {
+            matches!(cmd, Command::Blend(_, mode) if matches!(BlendType::from(mode.clone()), BlendType::Complex(_)))
+        });
+
+        if !has_complex_blends {
+            // Simple path: single render pass for everything.
+            let load_op = match clear_color {
+                Some(color) => wgpu::LoadOp::Clear(color),
+                None => wgpu::LoadOp::Load,
+            };
+
+            let color_attachment = Self::make_color_attachment(target_view, msaa_view, load_op);
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Main render pass"),
+                color_attachments: &[Some(color_attachment)],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_stencil_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                }),
+                ..Default::default()
+            });
+            render_pass.set_bind_group(0, &self.globals_bind_group, &[]);
+            self.execute_commands(&mut render_pass, commands, transform_index, mask_state, num_masks, blend_override);
+            return;
+        }
+
+        // Complex path: process commands one-by-one, breaking out for complex blends.
+        let mut first_pass = true;
+        let mut cmd_idx = 0;
+
+        while cmd_idx < commands.commands.len() {
+            // Find the next complex blend command starting from cmd_idx.
+            let mut complex_at = None;
+            for i in cmd_idx..commands.commands.len() {
+                if let Command::Blend(_, mode) = &commands.commands[i] {
+                    if matches!(BlendType::from(mode.clone()), BlendType::Complex(_)) {
+                        complex_at = Some(i);
+                        break;
+                    }
+                }
+            }
+
+            // Render non-complex-blend commands up to the complex blend (or end).
+            let batch_end = complex_at.unwrap_or(commands.commands.len());
+            if batch_end > cmd_idx {
+                let load_op = if first_pass {
+                    first_pass = false;
+                    match clear_color {
+                        Some(color) => wgpu::LoadOp::Clear(color),
+                        None => wgpu::LoadOp::Load,
+                    }
+                } else {
+                    wgpu::LoadOp::Load
+                };
+
+                {
+                    let color_attachment = Self::make_color_attachment(target_view, msaa_view, load_op);
+                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Render pass (pre-blend batch)"),
+                        color_attachments: &[Some(color_attachment)],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.depth_stencil_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
+                        }),
+                        ..Default::default()
+                    });
+                    render_pass.set_bind_group(0, &self.globals_bind_group, &[]);
+
+                    // Execute the batch of commands individually.
+                    for i in cmd_idx..batch_end {
+                        self.execute_single_command(&mut render_pass, &commands.commands[i], transform_index, mask_state, num_masks, blend_override);
+                    }
+                }
+                // render_pass is dropped here, freeing the encoder.
+            }
+
+            // Process the complex blend command, if any.
+            if let Some(blend_idx) = complex_at {
+                if first_pass {
+                    first_pass = false;
+                    // Clear the target if this is the first thing we do.
+                    if let Some(color) = clear_color {
+                        let color_attachment = Self::make_color_attachment(
+                            target_view, msaa_view,
+                            wgpu::LoadOp::Clear(color),
+                        );
+                        let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("Clear pass"),
+                            color_attachments: &[Some(color_attachment)],
+                            depth_stencil_attachment: None,
+                            ..Default::default()
+                        });
+                        // Drop immediately after scope, just clearing.
+                    }
+                }
+
+                if let Command::Blend(sub_commands, blend_mode) = &commands.commands[blend_idx] {
+                    if let BlendType::Complex(complex) = BlendType::from(blend_mode.clone()) {
+                        self.execute_complex_blend(
+                            encoder,
+                            target_view,
+                            msaa_view,
+                            sub_commands,
+                            complex,
+                            transform_index,
+                            mask_state,
+                            num_masks,
+                        );
+                    }
+                }
+                cmd_idx = blend_idx + 1;
+            } else {
+                cmd_idx = batch_end;
+            }
+        }
+    }
+
+    /// Execute a complex blend operation by rendering sub-commands to an
+    /// intermediate texture and compositing with the framebuffer.
+    fn execute_complex_blend(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target_view: &wgpu::TextureView,
+        _msaa_view: Option<&wgpu::TextureView>,
+        sub_commands: &CommandList,
+        complex: ComplexBlend,
+        transform_index: &mut u32,
+        _mask_state: &mut MaskState,
+        _num_masks: &mut u32,
+    ) {
+        let width = self.viewport_width.max(1);
+        let height = self.viewport_height.max(1);
+
+        // 1. Create an intermediate texture for the sub-command rendering.
+        //    This is always single-sampled; MSAA resolves into it.
+        let intermediate_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Blend intermediate texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.surface_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let intermediate_view = intermediate_texture.create_view(&Default::default());
+
+        // Create MSAA and depth/stencil textures matching the current sample count.
+        let intermediate_msaa_view = if self.sample_count > 1 {
+            let msaa_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Blend intermediate MSAA"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: self.sample_count,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.surface_format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            Some(msaa_tex.create_view(&Default::default()))
+        } else {
+            None
+        };
+        let (_, intermediate_depth_view) = create_depth_stencil(&self.device, width, height, self.sample_count);
+
+        // 2. Render sub-commands to the intermediate texture (clear to transparent).
+        {
+            let color_attachment = Self::make_color_attachment(
+                &intermediate_view,
+                intermediate_msaa_view.as_ref(),
+                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+            );
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Blend sub-command pass"),
+                color_attachments: &[Some(color_attachment)],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &intermediate_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                }),
+                ..Default::default()
+            });
+            render_pass.set_bind_group(0, &self.globals_bind_group, &[]);
+
+            // Reset mask state for sub-command rendering.
+            let mut sub_mask_state = MaskState::NoMask;
+            let mut sub_num_masks = 0u32;
+            self.execute_commands(&mut render_pass, sub_commands, transform_index, &mut sub_mask_state, &mut sub_num_masks, None);
+        }
+        // render_pass dropped, encoder available.
+
+        // 3. Copy the current framebuffer to the blend buffer (parent texture).
+        // The target_view comes from the offscreen buffer which has COPY_SRC usage.
+        if let (Some(offscreen), Some(blend_buf)) = (&self.offscreen_buffer, &self.blend_buffer) {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: offscreen,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: blend_buf,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        // 4. Create the blend bind group with both textures.
+        let blend_sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Blend sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let parent_view = self.blend_buffer_view.as_ref().unwrap();
+        let blend_bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Blend bind group"),
+            layout: &self.bind_layouts.blend,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(parent_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&intermediate_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&blend_sampler),
+                },
+            ],
+        });
+
+        // 5. Composite using the blend shader onto the framebuffer.
+        //    The complex blend pipelines are created with sample_count=1,
+        //    so we render directly to target_view without MSAA.
+        //    This writes the composited result to the offscreen buffer directly.
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Blend composite pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            render_pass.set_pipeline(&self.pipelines.complex_blend[complex]);
+            render_pass.set_bind_group(0, &blend_bind_group, &[]);
+            render_pass.draw(0..3, 0..1);
         }
     }
 }

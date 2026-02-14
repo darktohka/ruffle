@@ -10,7 +10,7 @@
 //! - **DrawMaskStencil**: Writes to stencil only (no color output).
 //! - **ClearMaskStencil**: Decrements stencil (no color output).
 
-use crate::blend::ComplexBlend;
+use crate::blend::{ComplexBlend, TrivialBlend};
 use crate::shaders::Shaders;
 use crate::{BezierTexVertex, BezierVertex, MaskState};
 use enum_map::{EnumMap, enum_map};
@@ -238,6 +238,8 @@ pub struct Pipelines {
     pub draw_masked_content: PipelineSet,
     /// Pipelines for clearing the stencil buffer (decrementing).
     pub clear_mask_stencil: PipelineSet,
+    /// Trivial blend mode pipelines (Add, Screen, Subtract) — only NoMask variant.
+    pub trivial_blend: EnumMap<TrivialBlend, PipelineSet>,
     /// Complex blend mode compositing pipelines (one per ComplexBlend variant).
     pub complex_blend: EnumMap<ComplexBlend, wgpu::RenderPipeline>,
 }
@@ -257,6 +259,12 @@ impl Pipelines {
             &layouts.blend,
         );
 
+        let trivial_blend = enum_map! {
+            blend => create_trivial_blend_pipeline_set(
+                device, shaders, format, sample_count, layouts, blend,
+            )
+        };
+
         Self {
             no_mask: create_pipeline_set(
                 device, shaders, format, sample_count, layouts,
@@ -274,6 +282,7 @@ impl Pipelines {
                 device, shaders, format, sample_count, layouts,
                 MaskState::ClearMaskStencil,
             ),
+            trivial_blend,
             complex_blend,
         }
     }
@@ -286,6 +295,11 @@ impl Pipelines {
             MaskState::DrawMaskedContent => &self.draw_masked_content,
             MaskState::ClearMaskStencil => &self.clear_mask_stencil,
         }
+    }
+
+    /// Get the pipeline set for a trivial blend mode.
+    pub fn for_trivial_blend(&self, blend: TrivialBlend) -> &PipelineSet {
+        &self.trivial_blend[blend]
     }
 }
 
@@ -609,5 +623,179 @@ fn create_complex_blend_pipelines(
                 cache: None,
             })
         }
+    }
+}
+
+/// Create a pipeline set for a trivial blend mode.
+/// Uses the NoMask stencil config but with a different blend state.
+fn create_trivial_blend_pipeline_set(
+    device: &wgpu::Device,
+    shaders: &Shaders,
+    format: wgpu::TextureFormat,
+    sample_count: u32,
+    layouts: &BindLayouts,
+    blend: TrivialBlend,
+) -> PipelineSet {
+    let (depth_stencil, _color_writes) = stencil_config(MaskState::NoMask);
+    let blend_state = blend.blend_state();
+    let suffix = format!(" [blend:{blend:?}]");
+
+    let color_vertex_layout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<BezierVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 8, shader_location: 1 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Sint32, offset: 16, shader_location: 2 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 20, shader_location: 3 },
+        ],
+    };
+
+    let tex_vertex_layout = wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<BezierTexVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 8, shader_location: 1 },
+            wgpu::VertexAttribute { format: wgpu::VertexFormat::Sint32, offset: 16, shader_location: 2 },
+        ],
+    };
+
+    let color_target = Some(wgpu::ColorTargetState {
+        format,
+        blend: Some(blend_state),
+        write_mask: wgpu::ColorWrites::ALL,
+    });
+
+    let multisample = wgpu::MultisampleState {
+        count: sample_count,
+        mask: !0,
+        alpha_to_coverage_enabled: false,
+    };
+
+    let primitive = wgpu::PrimitiveState {
+        topology: wgpu::PrimitiveTopology::TriangleList,
+        front_face: wgpu::FrontFace::Ccw,
+        cull_mode: None,
+        ..Default::default()
+    };
+
+    let color_fill_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(&format!("Bezier color fill layout{suffix}")),
+        bind_group_layouts: &[&layouts.globals, &layouts.transforms],
+        push_constant_ranges: &[],
+    });
+
+    let color_fill = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(&format!("Bezier color fill pipeline{suffix}")),
+        layout: Some(&color_fill_layout),
+        vertex: wgpu::VertexState {
+            module: &shaders.bezier_fill,
+            entry_point: Some("main_vertex"),
+            buffers: &[color_vertex_layout],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shaders.bezier_fill,
+            entry_point: Some("main_fragment"),
+            targets: &[color_target.clone()],
+            compilation_options: Default::default(),
+        }),
+        primitive,
+        depth_stencil: Some(depth_stencil.clone()),
+        multisample,
+        multiview: None,
+        cache: None,
+    });
+
+    let gradient_fill_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(&format!("Bezier gradient fill layout{suffix}")),
+        bind_group_layouts: &[&layouts.globals, &layouts.transforms, &layouts.gradient],
+        push_constant_ranges: &[],
+    });
+
+    let gradient_fill = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(&format!("Bezier gradient fill pipeline{suffix}")),
+        layout: Some(&gradient_fill_layout),
+        vertex: wgpu::VertexState {
+            module: &shaders.bezier_gradient,
+            entry_point: Some("main_vertex"),
+            buffers: &[tex_vertex_layout.clone()],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shaders.bezier_gradient,
+            entry_point: Some("main_fragment"),
+            targets: &[color_target.clone()],
+            compilation_options: Default::default(),
+        }),
+        primitive,
+        depth_stencil: Some(depth_stencil.clone()),
+        multisample,
+        multiview: None,
+        cache: None,
+    });
+
+    let bitmap_fill_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(&format!("Bezier bitmap fill layout{suffix}")),
+        bind_group_layouts: &[&layouts.globals, &layouts.transforms, &layouts.bitmap],
+        push_constant_ranges: &[],
+    });
+
+    let bitmap_fill = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(&format!("Bezier bitmap fill pipeline{suffix}")),
+        layout: Some(&bitmap_fill_layout),
+        vertex: wgpu::VertexState {
+            module: &shaders.bezier_bitmap,
+            entry_point: Some("main_vertex"),
+            buffers: &[tex_vertex_layout.clone()],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shaders.bezier_bitmap,
+            entry_point: Some("main_fragment"),
+            targets: &[color_target.clone()],
+            compilation_options: Default::default(),
+        }),
+        primitive,
+        depth_stencil: Some(depth_stencil.clone()),
+        multisample,
+        multiview: None,
+        cache: None,
+    });
+
+    let render_bitmap_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(&format!("Bezier render_bitmap layout{suffix}")),
+        bind_group_layouts: &[&layouts.globals, &layouts.transforms, &layouts.render_bitmap],
+        push_constant_ranges: &[],
+    });
+
+    let render_bitmap = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(&format!("Bezier render_bitmap pipeline{suffix}")),
+        layout: Some(&render_bitmap_layout),
+        vertex: wgpu::VertexState {
+            module: &shaders.render_bitmap,
+            entry_point: Some("main_vertex"),
+            buffers: &[tex_vertex_layout],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shaders.render_bitmap,
+            entry_point: Some("main_fragment"),
+            targets: &[color_target],
+            compilation_options: Default::default(),
+        }),
+        primitive,
+        depth_stencil: Some(depth_stencil),
+        multisample,
+        multiview: None,
+        cache: None,
+    });
+
+    PipelineSet {
+        color_fill,
+        gradient_fill,
+        bitmap_fill,
+        render_bitmap,
     }
 }

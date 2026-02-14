@@ -1153,6 +1153,17 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
                     };
                     let mesh = as_bezier_mesh(shape);
                     for draw in &mesh.draws {
+                        // Mask generation/clearing should use fill contours only.
+                        // Strokes must not contribute to mask stencil values.
+                        if draw.is_stroke
+                            && matches!(
+                                *mask_state,
+                                MaskState::DrawMaskStencil | MaskState::ClearMaskStencil
+                            )
+                        {
+                            continue;
+                        }
+
                         match &draw.draw_type {
                             DrawType::Color => {
                                 render_pass.set_pipeline(&pipelines.color_fill);
@@ -1335,6 +1346,7 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
                     render_pass.set_stencil_reference(*num_masks - 1);
 
                     // 2. Draw mask geometry (writes to stencil, not color).
+                    let mask_transform_start = *transform_index;
                     self.execute_commands(render_pass, mask_commands, transform_index, mask_state, num_masks, None);
 
                     // 3. Activate mask: switch to drawing masked content.
@@ -1349,8 +1361,18 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
                     render_pass.set_stencil_reference(*num_masks);
 
                     // Re-draw mask geometry to decrement stencil.
-                    // Since we can't re-iterate mask_commands without double-counting
-                    // transforms, we instead directly pop the mask level.
+                    // Reuse the same transform offsets consumed by the first mask pass.
+                    let mut clear_transform_index = mask_transform_start;
+                    self.execute_commands(
+                        render_pass,
+                        mask_commands,
+                        &mut clear_transform_index,
+                        mask_state,
+                        num_masks,
+                        None,
+                    );
+
+                    // Finally pop one mask level.
                     *num_masks -= 1;
                     render_pass.set_stencil_reference(*num_masks);
                     if *num_masks == 0 {

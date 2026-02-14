@@ -62,6 +62,9 @@ pub struct Draw {
     pub vertex_buffer: wgpu::Buffer,
     pub index_buffer: wgpu::Buffer,
     pub num_indices: u32,
+    /// True when this draw comes from `DrawPath::Stroke`.
+    /// Mask rendering should ignore stroke draws and only use fill geometry.
+    pub is_stroke: bool,
 }
 
 /// What kind of fill this draw uses.
@@ -202,6 +205,7 @@ fn build_fill_draw(
             vertex_buffer,
             index_buffer,
             num_indices: indices.len() as u32,
+            is_stroke: false,
         })
     } else {
         let (vertices, indices) = build_fill_geometry_tex(commands);
@@ -338,6 +342,7 @@ fn build_fill_draw(
             vertex_buffer,
             index_buffer,
             num_indices: indices.len() as u32,
+            is_stroke: false,
         })
     }
 }
@@ -770,6 +775,7 @@ fn build_stroke_draw(
             vertex_buffer,
             index_buffer,
             num_indices: indices.len() as u32,
+            is_stroke: true,
         })
     } else {
         // Gradient or bitmap stroke: use BezierTexVertex.
@@ -892,6 +898,7 @@ fn build_stroke_draw(
             vertex_buffer,
             index_buffer,
             num_indices: indices.len() as u32,
+            is_stroke: true,
         })
     }
 }

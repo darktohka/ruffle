@@ -79,6 +79,7 @@
 
 pub mod backend;
 pub mod blend;
+pub mod filters;
 mod mesh;
 mod pipelines;
 mod shaders;
@@ -187,14 +188,17 @@ pub struct AnalyticParams {
     pub fill_rule: u32,
     /// Stroke half-width in object-space pixels.
     pub half_width: f32,
-    /// Packed cap/join flags for future expansion.
+    /// Packed cap flags: bits 0-1 = start cap, bits 2-3 = end cap.
+    /// 0 = Butt, 1 = Round, 2 = Square.
     pub cap_join_flags: u32,
     /// Stroke `LineScaleMode` (matches SWF `allow_scale_x/y` flags):
     /// 0 = None (never scale), 1 = Horizontal, 2 = Vertical, 3 = Both (default).
     pub scale_mode: u32,
-    /// Reserved. Kept at 2 words so the struct size is 48 bytes, matching WGSL
-    /// uniform layout rounding to 16-byte alignment.
-    pub _pad0: [u32; 2],
+    /// Join style: 0 = Round, 1 = Bevel, 2 = Miter.
+    pub join_style: u32,
+    /// Miter limit in object-space pixels (miter_limit_factor * half_width).
+    /// Only meaningful when join_style == 2 (Miter).
+    pub miter_limit: f32,
 }
 
 /// A GPU texture owned by this backend.

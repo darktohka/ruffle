@@ -30,8 +30,8 @@ struct AnalyticParams {
     half_width: f32,
     cap_join_flags: u32,
     scale_mode: u32,
-    _pad0: u32,
-    _pad1: u32,
+    join_style: u32,
+    miter_limit: f32,
 };
 
 @group(3) @binding(0) var<storage, read> analytic_segments: array<AnalyticSegment>;
@@ -224,7 +224,7 @@ fn min_dist2_to_segment(seg: AnalyticSegment, p: vec2<f32>) -> f32 {
     return best;
 }
 
-/// Compute signed distance from point to the stroke with cap handling.
+/// Compute signed distance from point to the stroke with cap and join handling.
 fn stroke_signed_distance(world_pos: vec2<f32>, effective_hw: f32) -> f32 {
     let start_cap = analytic_params.cap_join_flags & 3u;
     let end_cap = (analytic_params.cap_join_flags >> 2u) & 3u;
@@ -240,6 +240,30 @@ fn stroke_signed_distance(world_pos: vec2<f32>, effective_hw: f32) -> f32 {
         best = min(best, min_dist2_to_segment(ws, world_pos));
     }
     var dist = sqrt(best);
+
+    // ---- Join handling ----
+    if n > 1u {
+        for (var i: u32 = 0u; i < n - 1u; i = i + 1u) {
+            let seg_a = segment_to_world(analytic_segments[i]);
+            let seg_b = segment_to_world(analytic_segments[i + 1u]);
+            let gap = seg_b.start - seg_a.end;
+            if dot(gap, gap) < 1e-4 {
+                let join_pt = seg_a.end;
+                var tan_a = segment_d1(seg_a, 1.0);
+                if dot(tan_a, tan_a) < 1e-10 { tan_a = seg_a.end - seg_a.start; }
+                var tan_b = segment_d1(seg_b, 0.0);
+                if dot(tan_b, tan_b) < 1e-10 { tan_b = seg_b.end - seg_b.start; }
+                let len_a = length(tan_a);
+                let len_b = length(tan_b);
+                if len_a < 1e-6 || len_b < 1e-6 { continue; }
+                let dir_a = tan_a / len_a;
+                let dir_b = tan_b / len_b;
+                let cross_val = dir_a.x * dir_b.y - dir_a.y * dir_b.x;
+                if abs(cross_val) < 1e-6 { continue; }
+                dist = apply_join(world_pos, join_pt, dir_a, dir_b, cross_val, effective_hw, dist);
+            }
+        }
+    }
 
     let first_seg = segment_to_world(analytic_segments[0u]);
     var start_tangent = segment_d1(first_seg, 0.0);
@@ -278,6 +302,82 @@ fn stroke_signed_distance(world_pos: vec2<f32>, effective_hw: f32) -> f32 {
     }
 
     return dist - effective_hw;
+}
+
+fn apply_join(
+    p: vec2<f32>,
+    join_pt: vec2<f32>,
+    dir_a: vec2<f32>,
+    dir_b: vec2<f32>,
+    cross_val: f32,
+    effective_hw: f32,
+    current_dist: f32,
+) -> f32 {
+    var dist = current_dist;
+    let join_type = analytic_params.join_style;
+    let n_a = vec2<f32>(-dir_a.y, dir_a.x) * effective_hw;
+    let n_b = vec2<f32>(-dir_b.y, dir_b.x) * effective_hw;
+    var omx: f32; var omy: f32; var mx: f32; var my: f32;
+    if cross_val > 0.0 {
+        omx = n_a.x; omy = n_a.y; mx = n_b.x; my = n_b.y;
+    } else {
+        omx = -n_a.x; omy = -n_a.y; mx = -n_b.x; my = -n_b.y;
+    }
+
+    if join_type == 0u { return dist; } // Round
+
+    if join_type == 1u {
+        // Bevel
+        let p0_outer = join_pt + vec2<f32>(omx, omy);
+        let p1_outer = join_pt + vec2<f32>(mx, my);
+        let bevel_mid = (p0_outer + p1_outer) * 0.5;
+        let bevel_dir = p1_outer - p0_outer;
+        let bevel_normal = normalize(vec2<f32>(-bevel_dir.y, bevel_dir.x));
+        let to_mid = bevel_mid - join_pt;
+        let bevel_n = select(-bevel_normal, bevel_normal, dot(bevel_normal, to_mid) > 0.0);
+        let d_bevel = dot(p - bevel_mid, bevel_n);
+        if d_bevel > 0.0 { dist = max(dist, d_bevel); }
+        return dist;
+    }
+
+    // Miter
+    let x10 = dir_a.x; let y10 = dir_a.y;
+    let x10p = -dir_b.x; let y10p = -dir_b.y;
+    let den = x10 * y10p - x10p * y10;
+    if abs(den) < 1e-10 {
+        let p0_outer = join_pt + vec2<f32>(omx, omy);
+        let p1_outer = join_pt + vec2<f32>(mx, my);
+        let bevel_mid = (p0_outer + p1_outer) * 0.5;
+        let bevel_dir = p1_outer - p0_outer;
+        let bevel_normal = normalize(vec2<f32>(-bevel_dir.y, bevel_dir.x));
+        let to_mid = bevel_mid - join_pt;
+        let bevel_n = select(-bevel_normal, bevel_normal, dot(bevel_normal, to_mid) > 0.0);
+        let d_bevel = dot(p - bevel_mid, bevel_n);
+        if d_bevel > 0.0 { dist = max(dist, d_bevel); }
+        return dist;
+    }
+    let p_a = join_pt + vec2<f32>(omx, omy);
+    let p_b = join_pt + vec2<f32>(mx, my);
+    let t_val = (x10p * (p_a.y - p_b.y) - y10p * (p_a.x - p_b.x)) / den;
+    let miter_pt = p_a + t_val * dir_a;
+    let miter_vec = miter_pt - join_pt;
+    let miter_len = length(miter_vec);
+    let miter_lim = analytic_params.miter_limit;
+    if miter_len <= miter_lim && miter_len > 1e-6 {
+        let d_to_miter = length(p - miter_pt);
+        dist = min(dist, d_to_miter);
+    } else {
+        let p0_outer = join_pt + vec2<f32>(omx, omy);
+        let p1_outer = join_pt + vec2<f32>(mx, my);
+        let bevel_mid = (p0_outer + p1_outer) * 0.5;
+        let bevel_dir = p1_outer - p0_outer;
+        let bevel_normal = normalize(vec2<f32>(-bevel_dir.y, bevel_dir.x));
+        let to_mid = bevel_mid - join_pt;
+        let bevel_n = select(-bevel_normal, bevel_normal, dot(bevel_normal, to_mid) > 0.0);
+        let d_bevel = dot(p - bevel_mid, bevel_n);
+        if d_bevel > 0.0 { dist = max(dist, d_bevel); }
+    }
+    return dist;
 }
 
 fn analytic_coverage(object_pos: vec2<f32>, aa_object: f32) -> f32 {

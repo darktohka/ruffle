@@ -4,6 +4,7 @@
 
 use crate::blend::ComplexBlend;
 use enum_map::{EnumMap, enum_map};
+use ruffle_render::shader_source::SHADER_FILTER_COMMON;
 
 /// Compiled shader modules for the Bézier renderer.
 #[derive(Debug)]
@@ -26,6 +27,12 @@ pub struct Shaders {
     pub copy: wgpu::ShaderModule,
     /// Complex blend mode shaders (one per ComplexBlend variant).
     pub blend_shaders: EnumMap<ComplexBlend, wgpu::ShaderModule>,
+    /// Filter shaders.
+    pub color_matrix_filter: wgpu::ShaderModule,
+    pub blur_filter: wgpu::ShaderModule,
+    pub glow_filter: wgpu::ShaderModule,
+    pub bevel_filter: wgpu::ShaderModule,
+    pub displacement_map_filter: wgpu::ShaderModule,
 }
 
 impl Shaders {
@@ -57,6 +64,31 @@ impl Shaders {
                 source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/copy.wgsl").into()),
             }),
             blend_shaders,
+            color_matrix_filter: make_filter_shader(
+                device,
+                "filter/color_matrix.wgsl",
+                include_str!("../shaders/filter/color_matrix.wgsl"),
+            ),
+            blur_filter: make_filter_shader(
+                device,
+                "filter/blur.wgsl",
+                include_str!("../shaders/filter/blur.wgsl"),
+            ),
+            glow_filter: make_filter_shader(
+                device,
+                "filter/glow.wgsl",
+                include_str!("../shaders/filter/glow.wgsl"),
+            ),
+            bevel_filter: make_filter_shader(
+                device,
+                "filter/bevel.wgsl",
+                include_str!("../shaders/filter/bevel.wgsl"),
+            ),
+            displacement_map_filter: make_filter_shader(
+                device,
+                "filter/displacement_map.wgsl",
+                include_str!("../shaders/filter/displacement_map.wgsl"),
+            ),
         }
     }
 }
@@ -84,5 +116,18 @@ fn make_blend_shader(
     device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(name),
         source: wgpu::ShaderSource::Wgsl(source.into()),
+    })
+}
+
+/// Filter shaders are prepended with `shader_filter_common.wgsl` which
+/// provides the shared vertex input/output structs and vertex transform.
+fn make_filter_shader(
+    device: &wgpu::Device,
+    name: &str,
+    source: &str,
+) -> wgpu::ShaderModule {
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(name),
+        source: wgpu::ShaderSource::Wgsl(format!("{SHADER_FILTER_COMMON}\n{source}").into()),
     })
 }

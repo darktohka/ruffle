@@ -243,6 +243,8 @@ fn build_fill_draw(
             0.0,
             3, // scale_mode = Both (unused for fills)
             0, // cap_join_flags unused for fills
+            0, // join_style unused for fills
+            0.0, // miter_limit unused for fills
         );
         Some((analytic_fill, analytic_bind_group))
     });
@@ -887,13 +889,8 @@ fn build_stroke_draw(
     };
 
     // The analytic stroke shader supports all cap styles (butt/round/square)
-    // via cap_join_flags. For now, join styles other than Round still fall back
-    // to classic mesh expansion.
-    let supports_analytic_stroke_style = matches!(join_style, LineJoinStyle::Round);
-
-    let maybe_analytic = if let Some(analytic_layout) = analytic_layout
-        && supports_analytic_stroke_style
-    {
+    // and all join styles (round/bevel/miter) via cap_join_flags and join params.
+    let maybe_analytic = if let Some(analytic_layout) = analytic_layout {
         let analytic_stroke = build_analytic_stroke_data(
             device,
             commands,
@@ -905,6 +902,7 @@ fn build_stroke_draw(
             scale_mode,
         )?;
 
+        let (join_bits, miter_limit_px) = join_style_to_params(join_style, half_width);
         let analytic_bind_group = create_analytic_bind_group(
             device,
             analytic_layout,
@@ -916,6 +914,8 @@ fn build_stroke_draw(
             half_width,
             scale_mode,
             pack_cap_join_flags(start_cap, end_cap),
+            join_bits,
+            miter_limit_px,
         );
         Some((analytic_stroke, analytic_bind_group))
     } else {
@@ -1163,6 +1163,20 @@ fn pack_cap_join_flags(start_cap: LineCapStyle, end_cap: LineCapStyle) -> u32 {
     cap_style_to_bits(start_cap) | (cap_style_to_bits(end_cap) << 2)
 }
 
+/// Convert a `LineJoinStyle` into a GPU join style index and miter limit in pixels.
+/// Returns (join_style_bits, miter_limit_px):
+///   0 = Round, 1 = Bevel, 2 = Miter.
+fn join_style_to_params(join: LineJoinStyle, half_width: f32) -> (u32, f32) {
+    match join {
+        LineJoinStyle::Round => (0, 0.0),
+        LineJoinStyle::Bevel => (1, 0.0),
+        LineJoinStyle::Miter(limit) => {
+            let limit_px = limit.to_f32() * half_width;
+            (2, limit_px)
+        }
+    }
+}
+
 fn create_analytic_bind_group(
     device: &wgpu::Device,
     analytic_layout: &wgpu::BindGroupLayout,
@@ -1174,6 +1188,8 @@ fn create_analytic_bind_group(
     half_width: f32,
     scale_mode: u32,
     cap_join_flags: u32,
+    join_style: u32,
+    miter_limit: f32,
 ) -> wgpu::BindGroup {
     let params = crate::AnalyticParams {
         bounds,
@@ -1186,7 +1202,8 @@ fn create_analytic_bind_group(
         half_width,
         cap_join_flags,
         scale_mode,
-        _pad0: [0, 0],
+        join_style,
+        miter_limit,
     };
     let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Analytic params"),
@@ -1231,6 +1248,7 @@ fn build_analytic_stroke_data(
 
     // Square caps extend by half_width beyond the endpoint, so widen bounds
     // by 2*half_width when either cap is square. Round/butt only need half_width.
+    // Miter joins can extend up to miter_limit * half_width beyond the path.
     let cap_extra = if !is_closed
         && (matches!(start_cap, LineCapStyle::Square) || matches!(end_cap, LineCapStyle::Square))
     {
@@ -1238,11 +1256,16 @@ fn build_analytic_stroke_data(
     } else {
         half_width
     };
+    let join_extra = match join_style {
+        LineJoinStyle::Miter(limit) => limit.to_f32() * half_width,
+        _ => half_width,
+    };
+    let extra = cap_extra.max(join_extra);
     let expanded_bounds = [
-        bounds[0] - cap_extra,
-        bounds[1] - cap_extra,
-        bounds[2] + cap_extra,
-        bounds[3] + cap_extra,
+        bounds[0] - extra,
+        bounds[1] - extra,
+        bounds[2] + extra,
+        bounds[3] + extra,
     ];
 
     let segment_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1625,19 +1648,42 @@ fn add_cap_color(
     }
 }
 
+/// Compute the intersection of two lines.
+/// Line 1: from (x0, y0) to (x1, y1).
+/// Line 2: from (x0p, y0p) to (x1p, y1p).
+/// Returns the intersection point, or None if lines are parallel.
+fn compute_line_intersection(
+    x0: f32, y0: f32, x1: f32, y1: f32,
+    x0p: f32, y0p: f32, x1p: f32, y1p: f32,
+) -> Option<[f32; 2]> {
+    let x10 = x1 - x0;
+    let y10 = y1 - y0;
+    let x10p = x1p - x0p;
+    let y10p = y1p - y0p;
+
+    let den = x10 * y10p - x10p * y10;
+    if den.abs() < 1e-10 {
+        return None;
+    }
+    let t = (x10p * (y0 - y0p) - y10p * (x0 - x0p)) / den;
+    Some([x0 + t * x10, y0 + t * y10])
+}
+
 /// Add a line join at a vertex where two segments meet (color vertices).
 fn add_join_color(
     point: [f32; 2],
-    n0: [f32; 2],   // normal of incoming segment
-    n1: [f32; 2],   // normal of outgoing segment
+    d0: [f32; 2],    // direction of incoming segment
+    n0: [f32; 2],    // normal of incoming segment
+    d1: [f32; 2],    // direction of outgoing segment
+    n1: [f32; 2],    // normal of outgoing segment
     half_width: f32,
     join_style: LineJoinStyle,
     color: [f32; 4],
     vertices: &mut Vec<BezierVertex>,
     indices: &mut Vec<u32>,
 ) {
-    // Determine which side the join is on using the cross product.
-    let cross = n0[0] * n1[1] - n0[1] * n1[0];
+    // Determine which side the join is on using the cross product of directions.
+    let cross = d0[0] * d1[1] - d0[1] * d1[0];
     if cross.abs() < 1e-6 {
         // Segments are nearly parallel, no join needed.
         return;
@@ -1645,61 +1691,60 @@ fn add_join_color(
 
     match join_style {
         LineJoinStyle::Miter(miter_limit) => {
-            // Compute the miter point.
-            let dot = n0[0] * n1[0] + n0[1] * n1[1];
-            let hw_sq = half_width * half_width;
-            let cos_half = ((1.0 + dot / hw_sq) / 2.0).sqrt().max(1e-6);
-            let miter_length = half_width / cos_half;
+            // Compute the miter point using line-line intersection of the
+            // offset edges, following the OpenJDK Stroker approach.
             let limit = miter_limit.to_f32() * half_width;
 
-            if miter_length <= limit {
-                // Miter: extend to the intersection point.
-                let avg_n = [
-                    (n0[0] + n1[0]) / (2.0 * cos_half * cos_half),
-                    (n0[1] + n1[1]) / (2.0 * cos_half * cos_half),
-                ];
-                // Fill the miter triangle on the outer side.
-                let base = vertices.len() as u32;
-                if cross > 0.0 {
-                    // Join is on the +normal side.
+            // Determine the outer side based on the turn direction.
+            let (omx, omy, mx, my) = if cross > 0.0 {
+                // Left turn: outer side is the +normal side.
+                (n0[0], n0[1], n1[0], n1[1])
+            } else {
+                // Right turn: outer side is the -normal side.
+                (-n0[0], -n0[1], -n1[0], -n1[1])
+            };
+
+            // Intersect the two outer offset lines to find the miter point.
+            // Line 1: (point - d0 + om) -> (point + om), i.e. the incoming offset edge.
+            // Line 2: (point + d1 + m) -> (point + m), i.e. the outgoing offset edge.
+            let miter_pt = compute_line_intersection(
+                (point[0] - d0[0]) + omx, (point[1] - d0[1]) + omy,
+                point[0] + omx, point[1] + omy,
+                (d1[0] + point[0]) + mx, (d1[1] + point[1]) + my,
+                point[0] + mx, point[1] + my,
+            );
+
+            if let Some(mp) = miter_pt {
+                let dx = mp[0] - point[0];
+                let dy = mp[1] - point[1];
+                let miter_len = (dx * dx + dy * dy).sqrt();
+
+                if miter_len <= limit {
+                    // Miter: fill the triangle fan from center through the miter point.
+                    let base = vertices.len() as u32;
                     vertices.push(BezierVertex {
                         position: point,
                         uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
                     });
                     vertices.push(BezierVertex {
-                        position: [point[0] + n0[0], point[1] + n0[1]],
+                        position: [point[0] + omx, point[1] + omy],
                         uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
                     });
                     vertices.push(BezierVertex {
-                        position: [point[0] + avg_n[0], point[1] + avg_n[1]],
+                        position: mp,
                         uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
                     });
                     vertices.push(BezierVertex {
-                        position: [point[0] + n1[0], point[1] + n1[1]],
+                        position: [point[0] + mx, point[1] + my],
                         uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
                     });
                     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
                 } else {
-                    vertices.push(BezierVertex {
-                        position: point,
-                        uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
-                    });
-                    vertices.push(BezierVertex {
-                        position: [point[0] - n0[0], point[1] - n0[1]],
-                        uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
-                    });
-                    vertices.push(BezierVertex {
-                        position: [point[0] - avg_n[0], point[1] - avg_n[1]],
-                        uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
-                    });
-                    vertices.push(BezierVertex {
-                        position: [point[0] - n1[0], point[1] - n1[1]],
-                        uv: [0.0, 0.0], fill_type: 0, color, _pad: 0,
-                    });
-                    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+                    // Miter limit exceeded: fall back to bevel.
+                    add_bevel_color(point, n0, n1, cross, color, vertices, indices);
                 }
             } else {
-                // Miter limit exceeded: fall back to bevel.
+                // Lines are parallel, fall back to bevel.
                 add_bevel_color(point, n0, n1, cross, color, vertices, indices);
             }
         }
@@ -1856,7 +1901,7 @@ fn expand_stroke_path_color(
     for i in 0..normals.len().saturating_sub(1) {
         let join_point = points[i + 1];
         add_join_color(
-            join_point, normals[i], normals[i + 1],
+            join_point, directions[i], normals[i], directions[i + 1], normals[i + 1],
             half_width, join_style, color, vertices, indices,
         );
     }
@@ -1866,7 +1911,9 @@ fn expand_stroke_path_color(
         // Closing join between last and first segment.
         add_join_color(
             points[points.len() - 1],
+            *directions.last().unwrap(),
             *normals.last().unwrap(),
+            directions[0],
             normals[0],
             half_width, join_style, color, vertices, indices,
         );
@@ -1957,44 +2004,52 @@ fn add_cap_tex(
 /// Add a line join (tex vertices, for gradient/bitmap strokes).
 fn add_join_tex(
     point: [f32; 2],
+    d0: [f32; 2],
     n0: [f32; 2],
+    d1: [f32; 2],
     n1: [f32; 2],
     half_width: f32,
     join_style: LineJoinStyle,
     vertices: &mut Vec<BezierTexVertex>,
     indices: &mut Vec<u32>,
 ) {
-    let cross = n0[0] * n1[1] - n0[1] * n1[0];
+    let cross = d0[0] * d1[1] - d0[1] * d1[0];
     if cross.abs() < 1e-6 {
         return;
     }
 
     match join_style {
         LineJoinStyle::Miter(miter_limit) => {
-            let dot = n0[0] * n1[0] + n0[1] * n1[1];
-            let hw_sq = half_width * half_width;
-            let cos_half = ((1.0 + dot / hw_sq) / 2.0).sqrt().max(1e-6);
-            let miter_length = half_width / cos_half;
             let limit = miter_limit.to_f32() * half_width;
 
-            if miter_length <= limit {
-                let avg_n = [
-                    (n0[0] + n1[0]) / (2.0 * cos_half * cos_half),
-                    (n0[1] + n1[1]) / (2.0 * cos_half * cos_half),
-                ];
-                let base = vertices.len() as u32;
-                if cross > 0.0 {
+            let (omx, omy, mx, my) = if cross > 0.0 {
+                (n0[0], n0[1], n1[0], n1[1])
+            } else {
+                (-n0[0], -n0[1], -n1[0], -n1[1])
+            };
+
+            let miter_pt = compute_line_intersection(
+                (point[0] - d0[0]) + omx, (point[1] - d0[1]) + omy,
+                point[0] + omx, point[1] + omy,
+                (d1[0] + point[0]) + mx, (d1[1] + point[1]) + my,
+                point[0] + mx, point[1] + my,
+            );
+
+            if let Some(mp) = miter_pt {
+                let dx = mp[0] - point[0];
+                let dy = mp[1] - point[1];
+                let miter_len = (dx * dx + dy * dy).sqrt();
+
+                if miter_len <= limit {
+                    let base = vertices.len() as u32;
                     vertices.push(BezierTexVertex { position: point, uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
-                    vertices.push(BezierTexVertex { position: [point[0] + n0[0], point[1] + n0[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
-                    vertices.push(BezierTexVertex { position: [point[0] + avg_n[0], point[1] + avg_n[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
-                    vertices.push(BezierTexVertex { position: [point[0] + n1[0], point[1] + n1[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+                    vertices.push(BezierTexVertex { position: [point[0] + omx, point[1] + omy], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+                    vertices.push(BezierTexVertex { position: mp, uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+                    vertices.push(BezierTexVertex { position: [point[0] + mx, point[1] + my], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+                    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
                 } else {
-                    vertices.push(BezierTexVertex { position: point, uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
-                    vertices.push(BezierTexVertex { position: [point[0] - n0[0], point[1] - n0[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
-                    vertices.push(BezierTexVertex { position: [point[0] - avg_n[0], point[1] - avg_n[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
-                    vertices.push(BezierTexVertex { position: [point[0] - n1[0], point[1] - n1[1]], uv: [0.0, 0.0], fill_type: 0, _pad: 0 });
+                    add_bevel_tex(point, n0, n1, cross, vertices, indices);
                 }
-                indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
             } else {
                 add_bevel_tex(point, n0, n1, cross, vertices, indices);
             }
@@ -2112,7 +2167,7 @@ fn expand_stroke_path_tex(
     // Joins.
     for i in 0..normals.len().saturating_sub(1) {
         add_join_tex(
-            points[i + 1], normals[i], normals[i + 1],
+            points[i + 1], directions[i], normals[i], directions[i + 1], normals[i + 1],
             half_width, join_style, vertices, indices,
         );
     }
@@ -2121,7 +2176,9 @@ fn expand_stroke_path_tex(
     if is_closed && normals.len() >= 2 {
         add_join_tex(
             points[points.len() - 1],
+            *directions.last().unwrap(),
             *normals.last().unwrap(),
+            directions[0],
             normals[0],
             half_width, join_style, vertices, indices,
         );

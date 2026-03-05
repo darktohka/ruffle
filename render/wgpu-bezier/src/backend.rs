@@ -15,6 +15,7 @@ use crate::blend::{BlendType, ComplexBlend, TrivialBlend};
 use crate::mesh::{self, BezierMesh, DrawType, as_bezier_mesh};
 use crate::pipelines::{BindLayouts, Pipelines};
 use crate::shaders::Shaders;
+use crate::filters::{FilterSource, Filters, as_texture};
 use crate::target::{RenderTarget, RenderTargetFrame};
 use crate::{
     BezierTexVertex, BezierVertex, GlobalsUniform, MaskState, Texture, Transforms,
@@ -29,6 +30,7 @@ use ruffle_render::bitmap::{
 };
 use ruffle_render::commands::CommandList;
 use ruffle_render::error::Error as BitmapError;
+use ruffle_render::filters::Filter;
 use ruffle_render::quality::StageQuality;
 use ruffle_render::shape_utils::{DistilledShape, DrawPath};
 use ruffle_render::transform::Transform;
@@ -214,6 +216,9 @@ pub struct BezierRenderBackend<T: RenderTarget> {
     // Copy pipeline for blitting textures (used for render_offscreen and blend compositing).
     copy_pipeline: wgpu::RenderPipeline,
     copy_bind_layout: wgpu::BindGroupLayout,
+
+    // GPU filter implementations.
+    filters: Filters,
 }
 
 impl<T: RenderTarget> BezierRenderBackend<T> {
@@ -326,6 +331,8 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
             bind_group_layouts: &[&copy_bind_layout],
             push_constant_ranges: &[],
         });
+        let filters = Filters::new(&device, &shaders);
+
         let copy_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Copy pipeline"),
             layout: Some(&copy_pipeline_layout),
@@ -392,6 +399,7 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
             offscreen_view: None,
             copy_pipeline,
             copy_bind_layout,
+            filters,
         })
     }
 
@@ -532,6 +540,77 @@ impl<T: RenderTarget> BezierRenderBackend<T> {
             self.msaa_view = None;
         }
     }
+
+    /// Process bitmap cache entries: render cached display objects and apply filters.
+    fn process_cache_entries(&mut self, cache_entries: Vec<BitmapCacheEntry>) {
+        for entry in cache_entries {
+            let texture = as_texture(&entry.handle);
+            let width = texture.texture.width();
+            let height = texture.texture.height();
+
+            if entry.filters.is_empty() {
+                // No filters: just render commands directly into the cache texture.
+                // For now, we skip command rendering for cache entries (would need
+                // full offscreen rendering support). The texture already has content.
+                continue;
+            }
+
+            // Render commands into the cache texture first, then apply filters.
+            // For now, we just apply filters to the existing texture content.
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Cache entry filter encoder"),
+                });
+
+            let mut current_texture: Option<wgpu::Texture> = None;
+
+            for filter in entry.filters {
+                let source_tex = current_texture
+                    .as_ref()
+                    .unwrap_or(&texture.texture);
+
+                let result = self.filters.apply(
+                    &self.device,
+                    &self.queue,
+                    &mut encoder,
+                    FilterSource::for_entire_texture(source_tex),
+                    filter,
+                );
+
+                current_texture = Some(result);
+            }
+
+            // Copy the final filtered result back to the original texture.
+            if let Some(ref filtered) = current_texture {
+                let copy_width = filtered.width().min(width);
+                let copy_height = filtered.height().min(height);
+                if copy_width > 0 && copy_height > 0 {
+                    encoder.copy_texture_to_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: filtered,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &texture.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {
+                            width: copy_width,
+                            height: copy_height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
+            }
+
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+    }
 }
 
 impl<T: RenderTarget> RenderBackend for BezierRenderBackend<T> {
@@ -620,11 +699,100 @@ impl<T: RenderTarget> RenderBackend for BezierRenderBackend<T> {
         None
     }
 
+    fn apply_filter(
+        &mut self,
+        source: BitmapHandle,
+        source_point: (u32, u32),
+        source_size: (u32, u32),
+        destination: BitmapHandle,
+        dest_point: (i32, i32),
+        filter: Filter,
+    ) -> Option<Box<dyn SyncHandle>> {
+        let source_texture = as_texture(&source);
+        let dest_texture = as_texture(&destination);
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Apply filter encoder"),
+            });
+
+        let result = self.filters.apply(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            FilterSource {
+                texture: &source_texture.texture,
+                point: source_point,
+                size: source_size,
+            },
+            filter,
+        );
+
+        // Copy filtered result back to the destination texture at dest_point.
+        let dest_x = dest_point.0.max(0) as u32;
+        let dest_y = dest_point.1.max(0) as u32;
+        let copy_width = result.width().min(dest_texture.texture.width().saturating_sub(dest_x));
+        let copy_height = result.height().min(dest_texture.texture.height().saturating_sub(dest_y));
+        if copy_width > 0 && copy_height > 0 {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &result,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &dest_texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: dest_x,
+                        y: dest_y,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: copy_width,
+                    height: copy_height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+
+        let copy_area = PixelRegion::for_whole_size(
+            dest_texture.texture.width(),
+            dest_texture.texture.height(),
+        );
+        Some(Box::new(QueueSyncHandle::AlreadyResolved {
+            handle: destination,
+            size: copy_area,
+        }))
+    }
+
+    fn is_filter_supported(&self, filter: &Filter) -> bool {
+        matches!(
+            filter,
+            Filter::BlurFilter(_)
+                | Filter::GlowFilter(_)
+                | Filter::DropShadowFilter(_)
+                | Filter::ColorMatrixFilter(_)
+                | Filter::BevelFilter(_)
+                | Filter::DisplacementMapFilter(_)
+        )
+    }
+
+    fn is_offscreen_supported(&self) -> bool {
+        true
+    }
+
     fn submit_frame(
         &mut self,
         clear: Color,
         commands: CommandList,
-        _cache_entries: Vec<BitmapCacheEntry>,
+        cache_entries: Vec<BitmapCacheEntry>,
     ) {
         // Reset per-frame state.
         self.transform_data.clear();
@@ -632,6 +800,9 @@ impl<T: RenderTarget> RenderBackend for BezierRenderBackend<T> {
         self.mask_state = MaskState::NoMask;
         self.num_masks = 0;
         self.bitmap_bind_cache.clear();
+
+        // Process bitmap cache entries (render cached display objects with filters).
+        self.process_cache_entries(cache_entries);
 
         // Get the next texture from the render target.
         let frame = match self.target.get_next_texture() {
@@ -870,10 +1041,75 @@ impl<T: RenderTarget> RenderBackend for BezierRenderBackend<T> {
 
     fn resolve_sync_handle(
         &mut self,
-        _handle: Box<dyn SyncHandle>,
-        _with_rgba: RgbaBufRead,
+        handle: Box<dyn SyncHandle>,
+        with_rgba: RgbaBufRead,
     ) -> Result<(), BitmapError> {
-        Err(BitmapError::Unimplemented("Sync handle resolution".into()))
+        if let Ok(sync) = Box::<dyn Any>::downcast::<QueueSyncHandle>(handle) {
+            match *sync {
+                QueueSyncHandle::AlreadyResolved { handle, size } => {
+                    let texture = as_texture(&handle);
+                    let width = size.width();
+                    let height = size.height();
+
+                    // Create a buffer to read back the texture data.
+                    let bytes_per_row = (width * 4 + 255) & !255; // align to 256
+                    let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Sync handle readback buffer"),
+                        size: (bytes_per_row * height) as u64,
+                        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                        mapped_at_creation: false,
+                    });
+
+                    let mut encoder = self.device.create_command_encoder(
+                        &wgpu::CommandEncoderDescriptor {
+                            label: Some("Sync handle readback encoder"),
+                        },
+                    );
+                    encoder.copy_texture_to_buffer(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &texture.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d {
+                                x: size.x_min,
+                                y: size.y_min,
+                                z: 0,
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: &buffer,
+                            layout: wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(bytes_per_row),
+                                rows_per_image: None,
+                            },
+                        },
+                        wgpu::Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    self.queue.submit(std::iter::once(encoder.finish()));
+
+                    let buffer_slice = buffer.slice(..);
+                    buffer_slice.map_async(wgpu::MapMode::Read, |_| {});
+                    self.device.poll(wgpu::PollType::Wait {
+                        submission_index: None,
+                        timeout: None,
+                    }).expect("Device poll failed");
+
+                    let data = buffer_slice.get_mapped_range();
+                    with_rgba(&data, bytes_per_row);
+                    drop(data);
+                    buffer.unmap();
+
+                    Ok(())
+                }
+            }
+        } else {
+            Err(BitmapError::Unimplemented("Unknown sync handle type".into()))
+        }
     }
 
     fn create_empty_texture(
@@ -1795,6 +2031,18 @@ fn color_to_color_transform(color: Color) -> ColorTransform {
         a_add: 0,
     }
 }
+
+/// A simple sync handle for filter operations. Since the bezier renderer
+/// uses synchronous queue submission, we can resolve immediately.
+#[derive(Debug)]
+enum QueueSyncHandle {
+    AlreadyResolved {
+        handle: BitmapHandle,
+        size: PixelRegion,
+    },
+}
+
+impl SyncHandle for QueueSyncHandle {}
 
 /// Build an orthographic projection view matrix for the given viewport size.
 ///

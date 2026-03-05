@@ -28,8 +28,8 @@ struct AnalyticParams {
     half_width: f32,
     cap_join_flags: u32,
     scale_mode: u32,
-    _pad0: u32,
-    _pad1: u32,
+    join_style: u32,
+    miter_limit: f32,
 };
 
 @group(2) @binding(0) var<storage, read> analytic_segments: array<AnalyticSegment>;
@@ -239,11 +239,14 @@ fn min_dist2_to_segment(seg: AnalyticSegment, p: vec2<f32>) -> f32 {
 }
 
 /// Compute signed distance from point `p` to the stroke defined by all
-/// segments, taking cap styles into account.
+/// segments, taking cap and join styles into account.
 ///
 /// Cap encoding in `cap_join_flags`:
 ///   bits 0-1: start cap (0=Butt, 1=Round, 2=Square)
 ///   bits 2-3: end cap   (0=Butt, 1=Round, 2=Square)
+///
+/// Join style in `join_style`:
+///   0 = Round, 1 = Bevel, 2 = Miter
 fn stroke_signed_distance(world_pos: vec2<f32>, effective_hw: f32) -> f32 {
     let start_cap = analytic_params.cap_join_flags & 3u;
     let end_cap = (analytic_params.cap_join_flags >> 2u) & 3u;
@@ -259,6 +262,48 @@ fn stroke_signed_distance(world_pos: vec2<f32>, effective_hw: f32) -> f32 {
         best = min(best, min_dist2_to_segment(ws, world_pos));
     }
     var dist = sqrt(best);
+
+    // ---- Join handling ----
+    // For each pair of consecutive segments, handle the join at their shared point.
+    if n > 1u {
+        for (var i: u32 = 0u; i < n - 1u; i = i + 1u) {
+            let seg_a = segment_to_world(analytic_segments[i]);
+            let seg_b = segment_to_world(analytic_segments[i + 1u]);
+
+            // Check if segments are connected (shared endpoint).
+            let gap = seg_b.start - seg_a.end;
+            if dot(gap, gap) < 1e-4 {
+                let join_pt = seg_a.end;
+
+                // Tangent at the end of seg_a (outgoing direction).
+                var tan_a = segment_d1(seg_a, 1.0);
+                if dot(tan_a, tan_a) < 1e-10 {
+                    tan_a = seg_a.end - seg_a.start;
+                }
+                // Tangent at the start of seg_b (incoming direction).
+                var tan_b = segment_d1(seg_b, 0.0);
+                if dot(tan_b, tan_b) < 1e-10 {
+                    tan_b = seg_b.end - seg_b.start;
+                }
+
+                let len_a = length(tan_a);
+                let len_b = length(tan_b);
+                if len_a < 1e-6 || len_b < 1e-6 {
+                    continue;
+                }
+                let dir_a = tan_a / len_a;
+                let dir_b = tan_b / len_b;
+
+                // Cross product determines turn direction.
+                let cross_val = dir_a.x * dir_b.y - dir_a.y * dir_b.x;
+                if abs(cross_val) < 1e-6 {
+                    continue; // Nearly parallel, no join.
+                }
+
+                dist = apply_join(world_pos, join_pt, dir_a, dir_b, cross_val, effective_hw, dist);
+            }
+        }
+    }
 
     // ---- Start cap ----
     let first_seg = segment_to_world(analytic_segments[0u]);
@@ -305,6 +350,116 @@ fn stroke_signed_distance(world_pos: vec2<f32>, effective_hw: f32) -> f32 {
     // Round (1): no clipping needed.
 
     return dist - effective_hw;
+}
+
+/// Apply join style distance modification at a joint between two segments.
+/// Returns the updated distance.
+fn apply_join(
+    p: vec2<f32>,
+    join_pt: vec2<f32>,
+    dir_a: vec2<f32>,
+    dir_b: vec2<f32>,
+    cross_val: f32,
+    effective_hw: f32,
+    current_dist: f32,
+) -> f32 {
+    var dist = current_dist;
+    let join_type = analytic_params.join_style;
+
+    // Normals of the two segments (perpendicular to direction, scaled by hw).
+    let n_a = vec2<f32>(-dir_a.y, dir_a.x) * effective_hw;
+    let n_b = vec2<f32>(-dir_b.y, dir_b.x) * effective_hw;
+
+    // The outer side depends on the turn direction.
+    // For a right turn (cross_val < 0), the outer side is the -normal side.
+    // For a left turn (cross_val > 0), the outer side is the +normal side.
+    var omx: f32; var omy: f32; var mx: f32; var my: f32;
+    if cross_val > 0.0 {
+        omx = n_a.x; omy = n_a.y; mx = n_b.x; my = n_b.y;
+    } else {
+        omx = -n_a.x; omy = -n_a.y; mx = -n_b.x; my = -n_b.y;
+    }
+
+    if join_type == 0u {
+        // Round: distance to the join point center gives natural rounding.
+        // Already handled by min_dist2_to_segment finding closest point on curves.
+        return dist;
+    }
+
+    if join_type == 1u {
+        // Bevel: clip the outer corner with the bevel line.
+        // The bevel line connects the two outer offset points.
+        let p0_outer = join_pt + vec2<f32>(omx, omy);
+        let p1_outer = join_pt + vec2<f32>(mx, my);
+        let bevel_mid = (p0_outer + p1_outer) * 0.5;
+        let bevel_dir = p1_outer - p0_outer;
+        let bevel_normal = normalize(vec2<f32>(-bevel_dir.y, bevel_dir.x));
+        // Make sure the bevel normal points outward (away from join_pt).
+        let to_mid = bevel_mid - join_pt;
+        let bevel_n = select(-bevel_normal, bevel_normal, dot(bevel_normal, to_mid) > 0.0);
+        let d_bevel = dot(p - bevel_mid, bevel_n);
+        if d_bevel > 0.0 {
+            dist = max(dist, d_bevel);
+        }
+        return dist;
+    }
+
+    // join_type == 2u: Miter
+    // Compute the miter intersection point.
+    let x10 = dir_a.x;
+    let y10 = dir_a.y;
+    let x10p = -dir_b.x;
+    let y10p = -dir_b.y;
+    let den = x10 * y10p - x10p * y10;
+
+    if abs(den) < 1e-10 {
+        // Parallel: fall back to bevel.
+        let p0_outer = join_pt + vec2<f32>(omx, omy);
+        let p1_outer = join_pt + vec2<f32>(mx, my);
+        let bevel_mid = (p0_outer + p1_outer) * 0.5;
+        let bevel_dir = p1_outer - p0_outer;
+        let bevel_normal = normalize(vec2<f32>(-bevel_dir.y, bevel_dir.x));
+        let to_mid = bevel_mid - join_pt;
+        let bevel_n = select(-bevel_normal, bevel_normal, dot(bevel_normal, to_mid) > 0.0);
+        let d_bevel = dot(p - bevel_mid, bevel_n);
+        if d_bevel > 0.0 {
+            dist = max(dist, d_bevel);
+        }
+        return dist;
+    }
+
+    // Line 1: outer edge of segment A at the join point.
+    let p_a = join_pt + vec2<f32>(omx, omy);
+    // Line 2: outer edge of segment B at the join point.
+    let p_b = join_pt + vec2<f32>(mx, my);
+
+    let t_val = (x10p * (p_a.y - p_b.y) - y10p * (p_a.x - p_b.x)) / den;
+    let miter_pt = p_a + t_val * dir_a;
+
+    let miter_vec = miter_pt - join_pt;
+    let miter_len = length(miter_vec);
+    let miter_lim = analytic_params.miter_limit;
+
+    if miter_len <= miter_lim && miter_len > 1e-6 {
+        // Within miter limit: the miter point extends the stroke.
+        // Distance from p to the miter point determines if we're inside the miter.
+        let d_to_miter = length(p - miter_pt);
+        dist = min(dist, d_to_miter);
+    } else {
+        // Miter limit exceeded: fall back to bevel.
+        let p0_outer = join_pt + vec2<f32>(omx, omy);
+        let p1_outer = join_pt + vec2<f32>(mx, my);
+        let bevel_mid = (p0_outer + p1_outer) * 0.5;
+        let bevel_dir = p1_outer - p0_outer;
+        let bevel_normal = normalize(vec2<f32>(-bevel_dir.y, bevel_dir.x));
+        let to_mid = bevel_mid - join_pt;
+        let bevel_n = select(-bevel_normal, bevel_normal, dot(bevel_normal, to_mid) > 0.0);
+        let d_bevel = dot(p - bevel_mid, bevel_n);
+        if d_bevel > 0.0 {
+            dist = max(dist, d_bevel);
+        }
+    }
+    return dist;
 }
 
 fn analytic_coverage(object_pos: vec2<f32>, aa_object: f32) -> f32 {
